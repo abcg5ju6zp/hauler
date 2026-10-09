@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -68,6 +69,14 @@ type OCI struct {
 	index   *ocispec.Index
 	nameMap *sync.Map // map[string]ocispec.Descriptor
 	sf      singleflight.Group
+
+	// generation is the committed snapshot identity read from index.json's
+	// hauler.dev/snapshot-generation annotation. Every content-changing
+	// commit bumps it; SnapshotView/Readers report it so callers and logs can
+	// name the exact snapshot a request observed. snapshotTime is the same
+	// generation's commit timestamp. Guarded by mu.
+	generation   uint64
+	snapshotTime string
 
 	// blobSem bounds blob writes in flight across this OCI's two write
 	// paths (WriteBlob, ociPusher.Push), scoped per-store. Acquire is
@@ -182,9 +191,148 @@ func nameMapKey(ref, kind string) (key string, ok bool, err error) {
 // AddIndex adds a descriptor to the index and updates it
 //
 //	The descriptor must use AnnotationRefName to identify itself
+//
+// AddIndex is a single-operation snapshot transaction: see BeginTx. Multi-artifact
+// updates (an image plus its signatures/referrers, a whole haul load, a batch
+// removal) must use an explicit Txn so a failure never publishes half of a
+// logical update.
 func (o *OCI) AddIndex(desc ocispec.Descriptor) error {
-	// Pure validation/parsing -- doesn't touch shared state -- stays outside
-	// the lock.
+	tx, err := o.BeginTx(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := tx.AddIndex(desc); err != nil {
+		tx.Rollback()
+		return err
+	}
+	// Per-artifact callers keep the checkpoint (coalesced-fsync) cadence; a
+	// rename is atomic either way, so readers still see only complete
+	// snapshots even before the fsync checkpoint lands.
+	_, err = tx.commit(false)
+	return err
+}
+
+// snapshotMetaFromIndex reads the generation/time recorded on a committed
+// index, tolerating indexes written before snapshots existed.
+func snapshotMetaFromIndex(idx *ocispec.Index) (uint64, string) {
+	if idx == nil || idx.Annotations == nil {
+		return 0, ""
+	}
+	var gen uint64
+	if raw := idx.Annotations[consts.SnapshotGenerationAnnotation]; raw != "" {
+		if n, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			gen = n
+		}
+	}
+	return gen, idx.Annotations[consts.SnapshotTimeAnnotation]
+}
+
+// SnapshotGeneration returns the generation of the index currently held in
+// memory (refreshed by LoadIndex/Walk/Resolve and after every commit).
+func (o *OCI) SnapshotGeneration() uint64 {
+	o.lock()
+	defer o.mu.Unlock()
+	return o.generation
+}
+
+// SnapshotTime returns the commit timestamp of the index held in memory.
+func (o *OCI) SnapshotTime() string {
+	o.lock()
+	defer o.mu.Unlock()
+	return o.snapshotTime
+}
+
+// SnapshotInfo returns the current generation, its commit timestamp, and the
+// count of catalogued descriptors -- the observable snapshot identity used by
+// `store info` and recovery checks.
+func (o *OCI) SnapshotInfo() (uint64, string, int) {
+	o.lock()
+	defer o.mu.Unlock()
+	count := 0
+	o.nameMap.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return o.generation, o.snapshotTime, count
+}
+
+// SnapshotView is a read lease on one committed snapshot. Hold it across the
+// whole logical request -- index walk plus every subsequent blob fetch/push --
+// so an exclusive GC/Flush boundary in this or another process waits until the
+// request completes instead of unlinking a blob the request still needs.
+// Commits (adds) do not contend with a View: blobs are immutable and index.json
+// switches atomically, so the request simply keeps observing the snapshot it
+// started on.
+type SnapshotView struct {
+	o       *OCI
+	release leaseRelease
+}
+
+// View acquires a shared snapshot lease. The lease is cross-process (flock on
+// <root>/.hauler/snapshot.lock) as well as in-process.
+func (o *OCI) View(ctx context.Context) (*SnapshotView, error) {
+	release, _, err := acquireView(o.root)
+	if err != nil {
+		return nil, err
+	}
+	return &SnapshotView{o: o, release: release}, nil
+}
+
+// Release ends the read lease, allowing waiting deletion boundaries to proceed.
+func (v *SnapshotView) Release() {
+	if v.release != nil {
+		v.release()
+		v.release = nil
+	}
+}
+
+// Generation reports the snapshot generation as observed at any point while
+// the view is held.
+func (v *SnapshotView) Generation() uint64 {
+	return v.o.SnapshotGeneration()
+}
+
+// Txn is one all-or-nothing index.json transition. Stage descriptors while
+// streaming their blobs (staged blobs are content-addressed and invisible
+// until referenced -- and protected from GC by Txn's shared snapshot lease),
+// then Commit once. On any error or Rollback, index.json is untouched and the
+// staged blobs remain unreferenced garbage reclaimed by a later GC.
+type Txn struct {
+	o         *OCI
+	viewRel   leaseRelease
+	upserts   []stagedEntry
+	upsertIdx map[string]int
+	removes   map[string]struct{}
+	done      bool
+}
+
+// stagedEntry pairs a buffered descriptor with the nameMap key it commits to.
+type stagedEntry struct {
+	key  string
+	desc ocispec.Descriptor
+}
+
+// BeginTx opens an update transaction holding a shared snapshot lease until
+// Commit or Rollback.
+func (o *OCI) BeginTx(ctx context.Context) (*Txn, error) {
+	release, _, err := acquireView(o.root)
+	if err != nil {
+		return nil, err
+	}
+	return &Txn{
+		o:         o,
+		viewRel:   release,
+		upsertIdx: map[string]int{},
+		removes:   map[string]struct{}{},
+	}, nil
+}
+
+// AddIndex buffers one descriptor into the transaction. Validation/parsing is
+// identical to the standalone AddIndex it replaces.
+func (tx *Txn) AddIndex(desc ocispec.Descriptor) error {
+	if tx.done {
+		return errors.New("content: transaction already committed")
+	}
 	if _, ok := desc.Annotations[ocispec.AnnotationRefName]; !ok {
 		return fmt.Errorf("descriptor must contain a reference from the annotation: %s", ocispec.AnnotationRefName)
 	}
@@ -197,27 +345,133 @@ func (o *OCI) AddIndex(desc ocispec.Descriptor) error {
 		return nil
 	}
 
-	o.lock()
-	defer o.mu.Unlock()
+	// Clone for the same alias reasons the standalone path clones: callers
+	// keep mutating desc after staging it.
+	staged := desc
+	staged.Annotations = maps.Clone(desc.Annotations)
 
-	// Skip the write when the stored descriptor is already byte-identical:
-	// index.json rewrites aren't otherwise batched (O(N^2) bytes as the
-	// index grows), only their fsync is (see indexCheckpointInterval).
-	if existing, ok := o.nameMap.Load(mapKey); ok {
-		if descriptorsEqual(existing.(ocispec.Descriptor), desc) {
-			return nil
+	if i, exists := tx.upsertIdx[mapKey]; exists {
+		tx.upserts[i] = stagedEntry{key: mapKey, desc: staged}
+		return nil
+	}
+	tx.upsertIdx[mapKey] = len(tx.upserts)
+	tx.upserts = append(tx.upserts, stagedEntry{key: mapKey, desc: staged})
+	delete(tx.removes, mapKey) // upsert-after-remove within one tx means replace
+	return nil
+}
+
+// Remove buffers a nameMap-key removal into the transaction.
+func (tx *Txn) Remove(key string) {
+	if tx.done {
+		return
+	}
+	tx.removes[key] = struct{}{}
+	if i, ok := tx.upsertIdx[key]; ok {
+		tx.upserts = append(tx.upserts[:i], tx.upserts[i+1:]...)
+		delete(tx.upsertIdx, key)
+		for k, idx := range tx.upsertIdx {
+			if idx > i {
+				tx.upsertIdx[k] = idx - 1
+			}
 		}
 	}
+}
 
-	// Clone the annotations before storing: the caller keeps its own copy of
-	// desc (AddArtifact returns the very descriptor it passed here), and
-	// storeFile/fetchChart annotate that copy afterwards to record the
-	// original reference. Aliasing the same map into nameMap would let those
-	// unsynchronized writes race saveIndexLocked's iteration, and would also
-	// make the follow-up AddIndex compare equal to itself and skip the save.
-	desc.Annotations = maps.Clone(desc.Annotations)
-	o.nameMap.Store(mapKey, desc)
-	return o.saveIndexCheckpointLocked()
+// Empty reports whether the transaction buffers any change.
+func (tx *Txn) Empty() bool {
+	return tx != nil && len(tx.upserts) == 0 && len(tx.removes) == 0
+}
+
+// Commit publishes the transaction: one commit.lock critical section that
+// rebuilds the baseline from the index.json committed on disk (so concurrent
+// processes can't lose each other's entries), applies the buffered change,
+// validates every new descriptor's referenced blobs, then writes index.json
+// once with a bumped generation. Durable additionally fsyncs the transition
+// (required for whole-unit boundaries like AddImage/load/removal; per-artifact
+// auto-transactions use the coalesced checkpoint cadence).
+func (tx *Txn) Commit() (uint64, error) {
+	return tx.commit(true)
+}
+
+func (tx *Txn) commit(durable bool) (uint64, error) {
+	if tx.done {
+		return 0, errors.New("content: transaction already committed")
+	}
+	tx.done = true
+	defer tx.finish()
+
+	commitRel, _, err := acquireCommit(tx.o.root)
+	if err != nil {
+		return 0, err
+	}
+	defer commitRel()
+
+	tx.o.lock()
+	defer tx.o.mu.Unlock()
+
+	gen, _, err := tx.o.applyChangesLocked(tx.upserts, tx.removes, durable, false)
+	return gen, err
+}
+
+// Rollback discards the transaction without touching index.json.
+func (tx *Txn) Rollback() {
+	if tx == nil || tx.done {
+		return
+	}
+	tx.done = true
+	tx.finish()
+}
+
+func (tx *Txn) finish() {
+	if tx.viewRel != nil {
+		tx.viewRel()
+		tx.viewRel = nil
+	}
+}
+
+// Target wraps the OCI target so pushes performed through it buffer manifest
+// index entries into tx instead of each saving index.json itself. Blob pushes
+// are unchanged. Used to commit a whole CopyAll/load as one snapshot.
+func (tx *Txn) Target() Target {
+	return &txnTarget{o: tx.o, tx: tx}
+}
+
+type txnTarget struct {
+	o  *OCI
+	tx *Txn
+}
+
+func (t *txnTarget) Resolve(ctx context.Context, ref string) (ocispec.Descriptor, error) {
+	return t.o.Resolve(ctx, ref)
+}
+
+func (t *txnTarget) Fetcher(ctx context.Context, ref string) (remotes.Fetcher, error) {
+	return t.o.Fetcher(ctx, ref)
+}
+
+func (t *txnTarget) Pusher(ctx context.Context, ref string) (remotes.Pusher, error) {
+	p, err := t.o.Pusher(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if op, ok := p.(*ociPusher); ok {
+		op.tx = t.tx
+		return op, nil
+	}
+	return p, nil
+}
+
+// Exclusive runs fn while holding snapshot.lock exclusive -- the deletion
+// boundary under which no View or staging Txn in any process can be active.
+// GC and Flush use it so index transition and blob unlink are observed as one
+// indivisible state change.
+func (o *OCI) Exclusive(ctx context.Context, fn func() error) error {
+	release, _, err := acquireExclusive(o.root)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
 }
 
 // descriptorsEqual reports whether two descriptors are equal in every field
@@ -260,28 +514,58 @@ func (o *OCI) LoadIndex() error {
 }
 
 // loadIndexLocked is LoadIndex's implementation. Callers must hold o.mu.
+//
+// The on-disk index is adopted as authoritative: the in-memory nameMap is
+// REPLACED, not merged. Uncommitted state never lives in nameMap (it lives in
+// Txn buffers), and replacing means a removal committed by another process
+// becomes visible instead of lingering as a stale in-memory ghost.
 func (o *OCI) loadIndexLocked() error {
+	idx, err := o.readIndexFileLocked()
+	if err != nil {
+		return err
+	}
+	o.index = idx
+	o.generation, o.snapshotTime = snapshotMetaFromIndex(idx)
+	o.nameMap = nameMapFromIndex(idx)
+	return nil
+}
+
+// readIndexFileLocked decodes index.json from disk; a missing file yields the
+// canonical empty index. Callers must hold o.mu (callers are serialized by the
+// same commit boundary that swaps the file).
+func (o *OCI) readIndexFileLocked() (*ocispec.Index, error) {
 	path := o.path(ocispec.ImageIndexFile)
-	idx, err := os.Open(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return err
+			return nil, err
 		}
-		o.index = &ocispec.Index{
+		return &ocispec.Index{
 			Versioned: specs.Versioned{
 				SchemaVersion: 2,
 			},
 			MediaType: ocispec.MediaTypeImageIndex,
-		}
-		return nil
+		}, nil
 	}
-	defer idx.Close()
+	defer f.Close()
 
-	if err := json.NewDecoder(idx).Decode(&o.index); err != nil {
-		return err
+	idx := &ocispec.Index{}
+	if err := json.NewDecoder(f).Decode(idx); err != nil {
+		return nil, err
 	}
+	return idx, nil
+}
 
-	for _, desc := range o.index.Manifests {
+// nameMapFromIndex normalizes a decoded index's descriptors into a fresh
+// nameMap: defaulting/normalizing the kind annotation into per-descriptor
+// annotation copies and deriving the same nameMapKey AddIndex/Txn use.
+// Malformed entries are skipped rather than making the whole store unreadable.
+func nameMapFromIndex(idx *ocispec.Index) *sync.Map {
+	m := &sync.Map{}
+	if idx == nil {
+		return m
+	}
+	for _, desc := range idx.Manifests {
 		// Set default kind if missing... normalize legacy dev.cosignproject.cosign values
 		kind := desc.Annotations[consts.KindAnnotationName]
 		kind = consts.NormalizeLegacyKind(kind)
@@ -296,28 +580,204 @@ func (o *OCI) loadIndexLocked() error {
 		normalized[consts.KindAnnotationName] = kind
 		desc.Annotations = normalized
 
-		// Must derive the same key AddIndex/ociPusher.Push would (see
-		// nameMapKey's comment), or an entry written this run and one loaded
-		// from a prior run collide under a different key than the one that
-		// wrote it.
 		mapKey, ok, err := nameMapKey(desc.Annotations[ocispec.AnnotationRefName], kind)
 		if err != nil {
 			// skip malformed entries rather than making the entire store unreadable
 			continue
 		}
 		if ok {
-			o.nameMap.Store(mapKey, desc)
+			m.Store(mapKey, desc)
+		}
+	}
+	return m
+}
+
+// applyChangesLocked is the single commit implementation: rebuild the
+// baseline from the index.json committed on disk, validate every new/changed
+// descriptor's referenced blobs, apply buffered upserts/removes, and -- when
+// anything changed -- bump generation and save index.json once. Callers must
+// hold commit.lock (cross-process serialization) and o.mu.
+//
+// durable requests fsync; forceSave additionally rewrites (and fsyncs)
+// index.json even when the content is unchanged -- SaveIndex's contract is to
+// make the on-disk index durable regardless, e.g. to flush a coalesced
+// checkpoint. A forced, unchanged save does not advance the generation.
+//
+// Returns the resulting generation and whether content changed.
+func (o *OCI) applyChangesLocked(staged []stagedEntry, removes map[string]struct{}, durable, forceSave bool) (uint64, bool, error) {
+	idx, err := o.readIndexFileLocked()
+	if err != nil {
+		return 0, false, err
+	}
+	disk := nameMapFromIndex(idx)
+	gen, _ := snapshotMetaFromIndex(idx)
+
+	// Anything that differs from the committed baseline is about to be
+	// published: prove its full descriptor graph is on disk first. A failed
+	// validation rejects the whole transition -- no half-published snapshot.
+	pending := make([]ocispec.Descriptor, 0, len(staged))
+	for _, e := range staged {
+		if old, ok := disk.Load(e.key); ok && descriptorsEqual(old.(ocispec.Descriptor), e.desc) {
+			continue
+		}
+		pending = append(pending, e.desc)
+	}
+	if vErr := o.validateCommittedLocked(pending); vErr != nil {
+		return gen, false, vErr
+	}
+
+	changed := false
+	for _, e := range staged {
+		if old, ok := disk.Load(e.key); ok && descriptorsEqual(old.(ocispec.Descriptor), e.desc) {
+			continue
+		}
+		disk.Store(e.key, e.desc)
+		changed = true
+	}
+	for key := range removes {
+		if _, loaded := disk.LoadAndDelete(key); loaded {
+			changed = true
 		}
 	}
 
+	// Always adopt the committed baseline in memory, even when this tx changed
+	// nothing, so external transitions are observed.
+	o.nameMap = disk
+	o.index = idx
+	o.generation = gen
+	if !changed {
+		if forceSave {
+			// Durable flush of the current state (e.g. coalesced checkpoint):
+			// same content, same generation, but fsynced now.
+			return gen, false, o.saveIndexLocked(true)
+		}
+		return gen, false, nil
+	}
+
+	o.generation = gen + 1
+	o.snapshotTime = o.now().UTC().Format(time.RFC3339Nano)
+	if o.index.Annotations == nil {
+		o.index.Annotations = map[string]string{}
+	}
+	o.index.Annotations[consts.SnapshotGenerationAnnotation] = strconv.FormatUint(o.generation, 10)
+	o.index.Annotations[consts.SnapshotTimeAnnotation] = o.snapshotTime
+
+	// Preserve the fsync-coalescing checkpoint cadence for high-frequency
+	// per-artifact commits (AddIndex): the rename is atomic either way, only
+	// power-loss durability is coalesced.
+	if !durable && o.now().Sub(o.lastDurableSave) < indexCheckpointInterval {
+		durable = false
+	} else {
+		durable = true
+	}
+	if err := o.saveIndexLocked(durable); err != nil {
+		return gen, false, err
+	}
+	return o.generation, true, nil
+}
+
+// manifestGraphShape captures the child references validation must walk,
+// across both image manifests and indexes.
+type manifestGraphShape struct {
+	Config    ocispec.Descriptor   `json:"config"`
+	Layers    []ocispec.Descriptor `json:"layers"`
+	Manifests []ocispec.Descriptor `json:"manifests"`
+}
+
+// validateCommittedLocked proves every pending descriptor's content graph is
+// materially present before it can be published: the blob file exists at its
+// content-addressed path and, when the descriptor names a size, matches it.
+// Manifest/index blobs are decoded and their config, layers, and child
+// manifests checked recursively. Foreign layers (URLs) and inline Data are
+// served without local storage and therefore exempt. A digest mismatch of
+// actual bytes is a Checker concern; this gate exists so a failed/partial
+// update can never publish dangling references.
+func (o *OCI) validateCommittedLocked(pending []ocispec.Descriptor) error {
+	seen := map[string]bool{}
+
+	var check func(d ocispec.Descriptor) error
+	check = func(d ocispec.Descriptor) error {
+		if d.Digest.Validate() != nil || len(d.URLs) > 0 || len(d.Data) > 0 {
+			return nil
+		}
+		key := d.Digest.String()
+		if seen[key] {
+			return nil
+		}
+		seen[key] = true
+
+		blobPath := filepath.Join(o.path(ocispec.ImageBlobsDir), d.Digest.Algorithm().String(), d.Digest.Hex())
+		info, err := os.Stat(blobPath)
+		if err != nil {
+			return fmt.Errorf("%w: referenced blob %s is not present: %v", ErrSnapshotValidation, key, err)
+		}
+		if d.Size > 0 && info.Size() != d.Size {
+			return fmt.Errorf("%w: referenced blob %s has size %d, descriptor requires %d", ErrSnapshotValidation, key, info.Size(), d.Size)
+		}
+
+		switch d.MediaType {
+		case ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageIndex,
+			consts.DockerManifestSchema2, consts.DockerManifestListSchema2:
+		default:
+			return nil
+		}
+
+		raw, err := os.ReadFile(blobPath)
+		if err != nil {
+			return fmt.Errorf("%w: reading manifest %s for validation: %v", ErrSnapshotValidation, key, err)
+		}
+		var shape manifestGraphShape
+		if err := json.Unmarshal(raw, &shape); err != nil {
+			return fmt.Errorf("%w: manifest %s is not valid JSON: %v", ErrSnapshotValidation, key, err)
+		}
+		if shape.Config.Digest.Validate() == nil {
+			if err := check(shape.Config); err != nil {
+				return err
+			}
+		}
+		for _, child := range shape.Layers {
+			if err := check(child); err != nil {
+				return err
+			}
+		}
+		for _, child := range shape.Manifests {
+			if err := check(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for _, d := range pending {
+		if err := check(d); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// SaveIndex will update the index on disk.
+// SaveIndex durably persists the in-memory nameMap under commit.lock, merging
+// it over whatever index.json another process committed in the meantime.
+// Callers that can express their change as add/remove operations should use a
+// Txn so deletions can't be resurrected by this merge; SaveIndex is retained
+// for "flush what this process holds" callers.
 func (o *OCI) SaveIndex() error {
+	release, _, err := acquireCommit(o.root)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	o.lock()
 	defer o.mu.Unlock()
-	return o.saveIndexLocked(true)
+
+	var staged []stagedEntry
+	o.nameMap.Range(func(key, value interface{}) bool {
+		staged = append(staged, stagedEntry{key: key.(string), desc: value.(ocispec.Descriptor)})
+		return true
+	})
+	_, _, err = o.applyChangesLocked(staged, nil, true, true)
+	return err
 }
 
 // saveIndexLocked is SaveIndex's implementation. Callers must hold o.mu.
@@ -367,7 +827,7 @@ func (o *OCI) saveIndexLocked(durable bool) error {
 	indexPath := o.path(ocispec.ImageIndexFile)
 	dir := filepath.Dir(indexPath)
 
-	tmp, err := os.CreateTemp(dir, "index-*.json")
+	tmp, err := os.CreateTemp(dir, "index-*"+consts.SnapshotIndexTempSuffix)
 	if err != nil {
 		return err
 	}
@@ -413,15 +873,6 @@ func (o *OCI) saveIndexLocked(durable bool) error {
 		o.stats.IndexDurableWrites.Add(1)
 	}
 	return nil
-}
-
-// saveIndexCheckpointLocked saves the index, fsync'ing only when at least
-// indexCheckpointInterval has elapsed since the last durable save. Used by
-// the per-artifact callers (AddIndex, ociPusher.Push); callers that are
-// explicit checkpoints call saveIndexLocked(true) directly. Callers must
-// hold o.mu.
-func (o *OCI) saveIndexCheckpointLocked() error {
-	return o.saveIndexLocked(o.now().Sub(o.lastDurableSave) >= indexCheckpointInterval)
 }
 
 // syncDir fsyncs a directory so a rename into it survives power loss;
@@ -819,6 +1270,12 @@ type ociPusher struct {
 	oci    *OCI
 	ref    string
 	digest string
+
+	// tx, when set, receives root-manifest index entries instead of each
+	// Push saving index.json itself. The owning transaction commits the whole
+	// CopyAll/load as one snapshot; when nil a Push auto-commits a
+	// single-entry transaction (the checkpoint-cadence path).
+	tx *Txn
 }
 
 // pusherRef reconstructs the AnnotationRefName-shaped string identifying a
@@ -846,47 +1303,29 @@ func pusherRef(ref, digest string) string {
 // Push returns a content writer for the given resource identified
 // by the descriptor.
 func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Writer, error) {
+	// Root-manifest index entries may only be published AFTER the manifest
+	// blob itself has been committed: validate/stage the normalized descriptor
+	// now, but fire it from the blob writer's successful Close (or immediately
+	// when the blob is already present), so commit-time validation always
+	// finds every referenced blob on disk.
+	var rootManifest *ocispec.Descriptor
 	switch d.MediaType {
 	case ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageIndex, consts.DockerManifestSchema2, consts.DockerManifestListSchema2:
 		// if the hash of the content matches that which was provided as the hash for the root, mark it
 		if p.digest != "" && p.digest == d.Digest.String() {
-			// Single critical section (Locked variants, to avoid deadlocking
-			// on this same lock) so no other save can land in between.
-			p.oci.lock()
-			if err := p.oci.loadIndexLocked(); err != nil {
-				p.oci.mu.Unlock()
-				return nil, err
-			}
-			kind := d.Annotations[consts.KindAnnotationName]
-			kind = consts.NormalizeLegacyKind(kind)
-			if kind == "" {
-				kind = consts.KindAnnotationImage
-			}
-			// Copy annotations map to avoid mutating the caller's descriptor,
-			// then write the normalized kind so Walk() callers see dev.hauler/... values.
-			normalizedAnnotations := make(map[string]string, len(d.Annotations)+1)
-			maps.Copy(normalizedAnnotations, d.Annotations)
-			normalizedAnnotations[consts.KindAnnotationName] = kind
-			d.Annotations = normalizedAnnotations
-			// Must derive the same key AddIndex/loadIndexLocked would (see
-			// nameMapKey's comment) -- store.Layout.CopyAll always appends the
-			// root descriptor's digest onto the destination ref, even for a
-			// tag-sourced entry, so pusherRef -- not a bare "p.ref@p.digest" --
-			// decides whether that digest actually belongs in the key.
-			mapKey, ok, keyErr := nameMapKey(pusherRef(p.ref, p.digest), kind)
-			if keyErr != nil {
-				p.oci.mu.Unlock()
-				return nil, keyErr
-			}
-			if ok {
-				p.oci.nameMap.Store(mapKey, d)
-			}
-			err := p.oci.saveIndexCheckpointLocked()
-			p.oci.mu.Unlock()
+			staged, err := p.normalizeRootManifest(d)
 			if err != nil {
 				return nil, err
 			}
+			rootManifest = staged
 		}
+	}
+
+	publish := func() error {
+		if rootManifest == nil {
+			return nil
+		}
+		return p.publishRootManifest(*rootManifest)
 	}
 
 	blobPath, err := p.oci.ensureBlob(d.Digest.Algorithm().String(), d.Digest.Hex())
@@ -896,7 +1335,11 @@ func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Wr
 
 	if _, err := os.Stat(blobPath); err == nil {
 		// Already exists: discard but validate digest. Returned before
-		// touching blobSem -- same reasoning as WriteBlob's fast path.
+		// touching blobSem -- same reasoning as WriteBlob's fast path. The
+		// blob is committed already, so publish the index entry immediately.
+		if err := publish(); err != nil {
+			return nil, err
+		}
 		return NewIoContentWriter(nopCloser{io.Discard}, WithOutputHash(d.Digest.String())), nil
 	}
 
@@ -916,11 +1359,58 @@ func (p *ociPusher) Push(ctx context.Context, d ocispec.Descriptor) (ccontent.Wr
 		p.oci.blobSem.Release(1)
 		return nil, err
 	}
+	// Fire only after the verified rename, making the index transition's
+	// referenced manifest blob guaranteed present.
+	w.afterRename = publish
 	w.releaseSem = func() {
 		p.oci.stats.exitBlob()
 		p.oci.blobSem.Release(1)
 	}
 	return w, nil
+}
+
+// normalizeRootManifest applies the same kind normalization and nameMap-key
+// derivation the old inline-save path used (see pusherRef/nameMapKey),
+// returning nil when the descriptor isn't catalogued under a key.
+func (p *ociPusher) normalizeRootManifest(d ocispec.Descriptor) (*ocispec.Descriptor, error) {
+	kind := d.Annotations[consts.KindAnnotationName]
+	kind = consts.NormalizeLegacyKind(kind)
+	if kind == "" {
+		kind = consts.KindAnnotationImage
+	}
+
+	normalized := d
+	normalized.Annotations = make(map[string]string, len(d.Annotations)+1)
+	maps.Copy(normalized.Annotations, d.Annotations)
+	normalized.Annotations[consts.KindAnnotationName] = kind
+
+	if _, ok, err := nameMapKey(pusherRef(p.ref, p.digest), kind); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, nil
+	}
+	return &normalized, nil
+}
+
+// publishRootManifest records the pushed root manifest in the bound
+// transaction (whole CopyAll/load publishes once), or auto-commits a
+// one-entry transaction at the coalesced checkpoint cadence when no tx is
+// bound.
+func (p *ociPusher) publishRootManifest(d ocispec.Descriptor) error {
+	if p.tx != nil {
+		return p.tx.AddIndex(d)
+	}
+
+	tx, err := p.oci.BeginTx(context.Background())
+	if err != nil {
+		return err
+	}
+	if err := tx.AddIndex(d); err != nil {
+		tx.Rollback()
+		return err
+	}
+	_, err = tx.commit(false)
+	return err
 }
 
 // ociBlobWriter streams pushed content into a temp file and, on successful
@@ -937,6 +1427,11 @@ type ociBlobWriter struct {
 	// releaseSem releases the blobSem permit acquired by ociPusher.Push. nil
 	// when constructed outside Push (e.g. in tests).
 	releaseSem func()
+
+	// afterRename, when set, publishes the root manifest's index entry once
+	// the blob rename succeeds -- the point at which the manifest is actually
+	// readable. Set by ociPusher.Push; nil for plain blob writers.
+	afterRename func() error
 }
 
 var _ ccontent.Writer = (*ociBlobWriter)(nil)
@@ -993,7 +1488,14 @@ func (w *ociBlobWriter) Close() (err error) {
 
 	// os.Rename silently replaces an existing target, which is correct here:
 	// the content is digest-verified to match what's expected at finalPath.
-	return os.Rename(w.tmpPath, w.finalPath)
+	if err := os.Rename(w.tmpPath, w.finalPath); err != nil {
+		return err
+	}
+	// Publish the index entry only after the manifest blob is committed.
+	if w.afterRename != nil {
+		return w.afterRename()
+	}
+	return nil
 }
 
 func (w *ociBlobWriter) Digest() digest.Digest {
@@ -1012,30 +1514,72 @@ func (w *ociBlobWriter) Truncate(size int64) error {
 	return fmt.Errorf("truncate not supported")
 }
 
-// RemoveFromIndex removes ref from nameMap only; callers (e.g.
-// store.Layout.RemoveArtifact) call SaveIndex separately afterward.
-func (o *OCI) RemoveFromIndex(ref string) {
+// RemoveFromIndex removes ref and publishes the deletion as one durable
+// snapshot transaction. Batch callers should use BeginTx with multiple
+// Txn.Remove calls and a single Commit instead.
+func (o *OCI) RemoveFromIndex(ref string) error {
+	tx, err := o.BeginTx(context.Background())
+	if err != nil {
+		return err
+	}
+	tx.Remove(ref)
+	if tx.Empty() {
+		tx.Rollback()
+		return nil
+	}
+	_, err = tx.Commit()
+	return err
+}
+
+// resetStateLocked clears all in-memory catalog state after an exclusive
+// Flush removed the on-disk layout. Callers must hold snapshot.lock exclusive
+// and o.mu.
+func (o *OCI) resetStateLocked() {
+	o.index = &ocispec.Index{
+		Versioned: specs.Versioned{
+			SchemaVersion: 2,
+		},
+		MediaType: ocispec.MediaTypeImageIndex,
+	}
+	o.nameMap = &sync.Map{}
+	o.generation = 0
+	o.snapshotTime = ""
+}
+
+// ResetState clears all in-memory catalog state. It is used by Layout.Flush
+// while already holding the exclusive snapshot boundary after the on-disk
+// layout has been removed.
+func (o *OCI) ResetState() {
 	o.lock()
 	defer o.mu.Unlock()
-	o.nameMap.Delete(ref)
+	o.resetStateLocked()
 }
 
 // UpdateAnnotations locates every descriptor for which match returns true,
 // replaces its annotations with a copy that has had apply run over it, and
-// persists the index, returning the number matched. The whole pass runs as
-// a single critical section so a concurrent UpdateAnnotations or Push can't
-// interleave a save in between; when nothing matches, index.json is not
-// re-saved.
+// persists the index, returning the number matched. The whole pass is one
+// commit.lock critical section over the on-disk baseline, so a concurrent
+// transaction or push can't interleave a save in between and external
+// entries can't be lost; when nothing matches, index.json is not re-saved.
 func (o *OCI) UpdateAnnotations(match func(ocispec.Descriptor) bool, apply func(map[string]string)) (int, error) {
+	release, _, err := acquireCommit(o.root)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+
 	o.lock()
 	defer o.mu.Unlock()
 
-	if err := o.loadIndexLocked(); err != nil {
+	idx, err := o.readIndexFileLocked()
+	if err != nil {
 		return 0, err
 	}
+	disk := nameMapFromIndex(idx)
+	gen, _ := snapshotMetaFromIndex(idx)
 
 	matched := 0
-	o.nameMap.Range(func(key, value interface{}) bool {
+	disk.Range(func(key, value interface{}) bool {
 		d := value.(ocispec.Descriptor)
 		if !match(d) {
 			return true
@@ -1044,14 +1588,28 @@ func (o *OCI) UpdateAnnotations(match func(ocispec.Descriptor) bool, apply func(
 		maps.Copy(cp, d.Annotations)
 		apply(cp)
 		d.Annotations = cp
-		o.nameMap.Store(key, d)
+		disk.Store(key, d)
 		matched++
 		return true
 	})
 
 	if matched == 0 {
+		// Still adopt the committed baseline so external changes are observed.
+		o.nameMap = disk
+		o.index = idx
+		o.generation = gen
 		return 0, nil
 	}
+
+	o.nameMap = disk
+	o.index = idx
+	o.generation = gen + 1
+	o.snapshotTime = o.now().UTC().Format(time.RFC3339Nano)
+	if o.index.Annotations == nil {
+		o.index.Annotations = map[string]string{}
+	}
+	o.index.Annotations[consts.SnapshotGenerationAnnotation] = strconv.FormatUint(o.generation, 10)
+	o.index.Annotations[consts.SnapshotTimeAnnotation] = o.snapshotTime
 	return matched, o.saveIndexLocked(true)
 }
 

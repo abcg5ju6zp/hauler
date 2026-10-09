@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"hauler.dev/go/hauler/v2/pkg/consts"
 )
 
 // seedStoreMetadata writes a store.json at dir claiming storeID, so MatchesStoreID (and updateStoreInventory's own pruning) treats dir as a real store.
@@ -20,6 +22,29 @@ func seedStoreMetadata(t *testing.T, dir, storeID string) {
 	}
 	if err := os.WriteFile(filepath.Join(dir, "store.json"), data, 0o644); err != nil {
 		t.Fatalf("failed to write store.json: %v", err)
+	}
+}
+
+// TestUpdateStoreInventory_SweepsCrashResidue verifies an interrupted
+// inventory rewrite (stores-*.json.tmp) is removed inside the locked update
+// and the committed stores.json is untouched.
+func TestUpdateStoreInventory_SweepsCrashResidue(t *testing.T) {
+	haulerDir := t.TempDir()
+
+	stale := filepath.Join(haulerDir, "stores-987654.json.tmp")
+	if err := os.WriteFile(stale, []byte("{partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	storeDir := filepath.Join(t.TempDir(), "sweep-store")
+	seedStoreMetadata(t, storeDir, "store-sweep")
+	updateStoreInventory(haulerDir, "store-sweep", storeDir)
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("crash residue %s still present after update", stale)
+	}
+	if _, err := os.Stat(filepath.Join(haulerDir, consts.DefaultStoreInventoryName)); err != nil {
+		t.Errorf("committed inventory missing: %v", err)
 	}
 }
 

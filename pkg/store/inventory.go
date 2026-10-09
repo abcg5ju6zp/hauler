@@ -13,6 +13,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 
 	"hauler.dev/go/hauler/v2/pkg/consts"
+	"hauler.dev/go/hauler/v2/pkg/content"
 )
 
 // inventoryLockTimeout bounds how long updateStoreInventory waits for the inventory lock, since it's a best-effort bookkeeping step that must never hang a store command over a stuck lock.
@@ -63,12 +64,26 @@ func saveInventory(haulerDir string, inv storeInventory) error {
 	if err != nil {
 		return err
 	}
-	// write to a temp file and rename to avoid a partially-written inventory
-	tmp := inventoryPath(haulerDir) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// Unique temp name (stores-*.json.tmp) in the same directory, then rename:
+	// recognizable to snapshot recovery and safe against concurrent writers.
+	tmp, err := os.CreateTemp(haulerDir, "stores-*"+consts.SnapshotIndexTempSuffix)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, inventoryPath(haulerDir))
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, inventoryPath(haulerDir))
 }
 
 // updateStoreInventory records storeID's path in <haulerDir>/stores.json, pruning stale entries, under a lock so concurrent hauler processes can't drop each other's update.
@@ -87,6 +102,10 @@ func updateStoreInventory(haulerDir, storeID, path string) {
 		return
 	}
 	defer fl.Unlock()
+
+	// Holding the inventory lock proves no other inventory writer is live, so
+	// any stores-*.json.tmp here is residue of a crashed update: sweep it.
+	content.SweepMatching(haulerDir, content.InventoryTempMatch)
 
 	inv := loadInventory(haulerDir)
 

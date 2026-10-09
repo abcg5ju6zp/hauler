@@ -78,6 +78,7 @@ func RemoveCmd(ctx context.Context, o *flags.RemoveOpts, s *store.Layout, ref st
 	type match struct {
 		reference string
 		desc      ocispec.Descriptor
+		typ       string
 	}
 	var matches []match
 
@@ -137,12 +138,26 @@ func RemoveCmd(ctx context.Context, o *flags.RemoveOpts, s *store.Layout, ref st
 		}
 	}
 
-	// remove artifact(s)
-	for _, m := range matches {
-		if err := s.RemoveArtifact(ctx, m.reference, m.desc); err != nil {
-			return fmt.Errorf("failed to remove artifact [%s]: %w", formatReference(m.reference, m.desc.Annotations[consts.KindAnnotationName]), err)
-		}
+	// Resolve the human-readable artifact types BEFORE removing: artifactType
+	// fetches each manifest blob from the store.
+	for i := range matches {
+		matches[i].typ = artifactType(ctx, s, matches[i].desc)
+	}
 
+	// Remove every matched artifact as one snapshot transition, then GC within
+	// the same exclusive boundary: clients never see a manifest entry whose
+	// blob is already gone, and the batch can't half-apply.
+	references := make([]string, 0, len(matches))
+	for _, m := range matches {
+		references = append(references, m.reference)
+	}
+	generation, removedCount, removedSize, err := s.RemoveArtifacts(ctx, references)
+	if err != nil {
+		return fmt.Errorf("failed to remove artifacts: %w", err)
+	}
+	l.Debugf("remove committed at snapshot generation [%d]", generation)
+
+	for _, m := range matches {
 		if auditLevel(ro) != "none" {
 			cleanRef := m.desc.Annotations[consts.ContainerdImageNameKey]
 			if cleanRef == "" {
@@ -151,7 +166,7 @@ func RemoveCmd(ctx context.Context, o *flags.RemoveOpts, s *store.Layout, ref st
 			e := audit.Entry{
 				StoreID:   s.StoreID,
 				Store:     s.Root,
-				Type:      artifactType(ctx, s, m.desc),
+				Type:      m.typ,
 				Command:   "store remove",
 				Args:      []string{ref},
 				Reference: cleanRef,
@@ -177,12 +192,8 @@ func RemoveCmd(ctx context.Context, o *flags.RemoveOpts, s *store.Layout, ref st
 		l.Infof("successfully removed [%s] of type [%s] with digest [%s]", formatReference(m.reference, m.desc.Annotations[consts.KindAnnotationName]), m.desc.MediaType, m.desc.Digest.String())
 	}
 
-	// clean up unreferenced blobs
-	l.Infof("cleaning up all unreferenced blobs...")
-	removedCount, removedSize, err := s.CleanUp(ctx)
-	if err != nil {
-		l.Warnf("garbage collection failed: [%v]", err)
-	} else if removedCount > 0 {
+	// unreferenced blobs were garbage-collected inside RemoveArtifacts' exclusive boundary
+	if removedCount > 0 {
 		l.Infof("successfully removed [%d] unreferenced blobs [freed %d bytes]", removedCount, removedSize)
 	}
 

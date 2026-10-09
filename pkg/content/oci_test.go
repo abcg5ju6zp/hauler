@@ -1241,11 +1241,47 @@ func newTestOCI(t *testing.T, dir string) *OCI {
 	return o
 }
 
+// testBlobMediaType is a non-manifest media type for index-mechanics tests:
+// commit-time snapshot validation only stats the blob's existence/size for
+// such descriptors and does not try to decode a manifest graph.
+const testBlobMediaType = "application/vnd.hauler.test.blob"
+
+// seedIndexBlob creates desc's blob file (desc.Size arbitrary bytes) so the
+// snapshot commit validation finds the referenced content present. Index
+// mechanics tests don't model real manifest graphs.
+func seedIndexBlob(t *testing.T, o *OCI, desc ocispec.Descriptor) {
+	t.Helper()
+	if desc.Digest.Validate() != nil {
+		t.Fatalf("seedIndexBlob: invalid digest %q", desc.Digest)
+	}
+	path := o.path(ocispec.ImageBlobsDir, desc.Digest.Algorithm().String(), desc.Digest.Hex())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	size := desc.Size
+	if size < 0 {
+		t.Fatalf("seedIndexBlob: negative size %d", size)
+	}
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), int(size)), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// seedAddIndex materializes desc's blob then indexes it -- the test-shape of
+// every real write path (blobs on disk before the index transition commits).
+func seedAddIndex(t *testing.T, o *OCI, desc ocispec.Descriptor) {
+	t.Helper()
+	seedIndexBlob(t, o, desc)
+	if err := o.AddIndex(desc); err != nil {
+		t.Fatalf("AddIndex: %v", err)
+	}
+}
+
 // refDescriptor builds a minimal, valid-for-AddIndex descriptor for index i:
 // a distinct tagged reference and a distinct digest.
 func refDescriptor(i int) ocispec.Descriptor {
 	return ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
+		MediaType: testBlobMediaType,
 		Digest:    digest.Digest(digestForIndex(i)),
 		Size:      int64(100 + i),
 		Annotations: map[string]string{
@@ -1276,6 +1312,7 @@ func TestOCI_ConcurrentAddIndex(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			seedIndexBlob(t, o, refDescriptor(i))
 			if err := o.AddIndex(refDescriptor(i)); err != nil {
 				errs <- fmt.Errorf("AddIndex(%d): %w", i, err)
 			}
@@ -1330,9 +1367,7 @@ func TestOCI_ConcurrentAddIndexAndWalk(t *testing.T) {
 
 	// Seed a few entries so Walk has something to range over from the start.
 	for i := 0; i < 5; i++ {
-		if err := o.AddIndex(refDescriptor(i)); err != nil {
-			t.Fatalf("seed AddIndex(%d): %v", i, err)
-		}
+		seedAddIndex(t, o, refDescriptor(i))
 	}
 
 	const n = 50
@@ -1342,6 +1377,7 @@ func TestOCI_ConcurrentAddIndexAndWalk(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			seedIndexBlob(t, o, refDescriptor(i))
 			_ = o.AddIndex(refDescriptor(i))
 		}(i)
 	}
@@ -1379,9 +1415,7 @@ func TestOCI_SaveIndexAtomic(t *testing.T) {
 	dir := t.TempDir()
 	o := newTestOCI(t, dir)
 	// Seed so index.json exists before the reader starts.
-	if err := o.AddIndex(refDescriptor(0)); err != nil {
-		t.Fatalf("seed AddIndex: %v", err)
-	}
+	seedAddIndex(t, o, refDescriptor(0))
 
 	indexPath := o.path(ocispec.ImageIndexFile)
 
@@ -1418,6 +1452,7 @@ func TestOCI_SaveIndexAtomic(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			seedIndexBlob(t, o, refDescriptor(i))
 			_ = o.AddIndex(refDescriptor(i))
 		}(i)
 	}
@@ -1458,9 +1493,7 @@ func TestOCI_WalkCallbackReenteringResolveDoesNotDeadlock(t *testing.T) {
 	o := newTestOCI(t, dir)
 
 	for i := 0; i < 3; i++ {
-		if err := o.AddIndex(refDescriptor(i)); err != nil {
-			t.Fatalf("seed AddIndex(%d): %v", i, err)
-		}
+		seedAddIndex(t, o, refDescriptor(i))
 	}
 
 	done := make(chan error, 1)
@@ -1505,9 +1538,7 @@ func TestOCI_UpdateAnnotations(t *testing.T) {
 	dir := t.TempDir()
 	o := newTestOCI(t, dir)
 	for i := 0; i < 3; i++ {
-		if err := o.AddIndex(refDescriptor(i)); err != nil {
-			t.Fatalf("seed AddIndex(%d): %v", i, err)
-		}
+		seedAddIndex(t, o, refDescriptor(i))
 	}
 
 	target := "example.com/repo1:tag1"
@@ -1557,9 +1588,7 @@ func TestOCI_UpdateAnnotations(t *testing.T) {
 func TestOCI_UpdateAnnotationsNoMatchDoesNotWrite(t *testing.T) {
 	dir := t.TempDir()
 	o := newTestOCI(t, dir)
-	if err := o.AddIndex(refDescriptor(0)); err != nil {
-		t.Fatalf("seed AddIndex: %v", err)
-	}
+	seedAddIndex(t, o, refDescriptor(0))
 
 	indexPath := o.path(ocispec.ImageIndexFile)
 	old := time.Now().Add(-1 * time.Hour).Truncate(time.Second)
@@ -1595,9 +1624,7 @@ func TestOCI_ConcurrentUpdateAnnotations(t *testing.T) {
 	o := newTestOCI(t, dir)
 	const n = 20
 	for i := 0; i < n; i++ {
-		if err := o.AddIndex(refDescriptor(i)); err != nil {
-			t.Fatalf("seed AddIndex(%d): %v", i, err)
-		}
+		seedAddIndex(t, o, refDescriptor(i))
 	}
 
 	var wg sync.WaitGroup
@@ -1650,9 +1677,7 @@ func TestOCI_AddIndexSkipsSaveWhenUnchanged(t *testing.T) {
 	o := newTestOCI(t, dir)
 
 	desc := refDescriptor(0)
-	if err := o.AddIndex(desc); err != nil {
-		t.Fatalf("AddIndex (first): %v", err)
-	}
+	seedAddIndex(t, o, desc)
 
 	indexPath := o.path(ocispec.ImageIndexFile)
 	old := time.Now().Add(-1 * time.Hour).Truncate(time.Second)
@@ -1676,6 +1701,7 @@ func TestOCI_AddIndexSkipsSaveWhenUnchanged(t *testing.T) {
 	// Size) -- this must write.
 	changed := desc
 	changed.Size = desc.Size + 1
+	seedIndexBlob(t, o, changed)
 	if err := o.AddIndex(changed); err != nil {
 		t.Fatalf("AddIndex (changed): %v", err)
 	}
@@ -1702,7 +1728,7 @@ func TestOCI_AddIndexSkipsSaveWhenUnchanged(t *testing.T) {
 // (no tag) into the given repository, with the given kind.
 func digestRefDescriptor(repo string, digestHex string, kind string) ocispec.Descriptor {
 	return ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
+		MediaType: testBlobMediaType,
 		Digest:    fakeDigest(digestHex),
 		Size:      100,
 		Annotations: map[string]string{
@@ -1744,12 +1770,8 @@ func TestOCI_AddIndex_DistinctDigestsSameRepoBothSurvive(t *testing.T) {
 	descA := digestRefDescriptor("example.com/repo", "a", consts.KindAnnotationImage)
 	descB := digestRefDescriptor("example.com/repo", "b", consts.KindAnnotationImage)
 
-	if err := o.AddIndex(descA); err != nil {
-		t.Fatalf("AddIndex(A): %v", err)
-	}
-	if err := o.AddIndex(descB); err != nil {
-		t.Fatalf("AddIndex(B): %v", err)
-	}
+	seedAddIndex(t, o, descA)
+	seedAddIndex(t, o, descB)
 
 	assertBothDigestsPresent(t, o, descA, descB)
 
@@ -1775,12 +1797,8 @@ func TestOCI_AddIndex_DistinctDigestsSameRepoSigsCoexist(t *testing.T) {
 	descA := digestRefDescriptor("example.com/repo", "c", consts.KindAnnotationSigs)
 	descB := digestRefDescriptor("example.com/repo", "d", consts.KindAnnotationSigs)
 
-	if err := o.AddIndex(descA); err != nil {
-		t.Fatalf("AddIndex(A): %v", err)
-	}
-	if err := o.AddIndex(descB); err != nil {
-		t.Fatalf("AddIndex(B): %v", err)
-	}
+	seedAddIndex(t, o, descA)
+	seedAddIndex(t, o, descB)
 
 	assertBothDigestsPresent(t, o, descA, descB)
 }
@@ -1793,7 +1811,7 @@ func TestOCI_AddIndex_TagAndDigestSameRepoCoexist(t *testing.T) {
 	o := newTestOCI(t, dir)
 
 	tagDesc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
+		MediaType: testBlobMediaType,
 		Digest:    fakeDigest("e"),
 		Size:      100,
 		Annotations: map[string]string{
@@ -1803,12 +1821,8 @@ func TestOCI_AddIndex_TagAndDigestSameRepoCoexist(t *testing.T) {
 	}
 	digestDesc := digestRefDescriptor("example.com/repo", "f", consts.KindAnnotationImage)
 
-	if err := o.AddIndex(tagDesc); err != nil {
-		t.Fatalf("AddIndex(tag): %v", err)
-	}
-	if err := o.AddIndex(digestDesc); err != nil {
-		t.Fatalf("AddIndex(digest): %v", err)
-	}
+	seedAddIndex(t, o, tagDesc)
+	seedAddIndex(t, o, digestDesc)
 
 	assertBothDigestsPresent(t, o, tagDesc, digestDesc)
 }
@@ -1854,6 +1868,13 @@ func TestOCIPusher_Push_DistinctDigestsSameRepoBothSurvive(t *testing.T) {
 			t.Fatalf("marshal manifest: %v", err)
 		}
 		manifestDigest := digest.FromBytes(manifestData)
+
+		// Snapshot commit validation requires the referenced config blob to
+		// be present at its content path (size 2 as declared above).
+		configPath := filepath.Join(blobsDir, fakeDigest(configHex).Hex())
+		if err := os.WriteFile(configPath, []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write config blob: %v", err)
+		}
 
 		ref := fmt.Sprintf("%s@%s", baseRef, manifestDigest.String())
 		pusher, err := o.Pusher(context.Background(), ref)
@@ -1916,7 +1937,7 @@ func TestOCIPusher_Push_DistinctDigestsSameRepoBothSurvive(t *testing.T) {
 func addTestIndexEntry(t *testing.T, o *OCI, i int) {
 	t.Helper()
 	desc := ocispec.Descriptor{
-		MediaType: consts.OCIManifestSchema1,
+		MediaType: testBlobMediaType,
 		Digest:    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
 		Size:      1,
 		Annotations: map[string]string{
@@ -1924,6 +1945,7 @@ func addTestIndexEntry(t *testing.T, o *OCI, i int) {
 			consts.KindAnnotationName: consts.KindAnnotationImage,
 		},
 	}
+	seedIndexBlob(t, o, desc)
 	if err := o.AddIndex(desc); err != nil {
 		t.Fatalf("AddIndex(%d): %v", i, err)
 	}
@@ -1983,6 +2005,10 @@ func TestSaveIndexIsAlwaysDurable(t *testing.T) {
 func TestCheckpointPathsProduceIdenticalIndex(t *testing.T) {
 	build := func(durable bool) []byte {
 		o := newTestOCI(t, t.TempDir())
+		// Pin the clock so both builds stamp the same snapshot-time
+		// annotation; the point under test is byte parity of the two fsync
+		// paths, not timestamps.
+		o.now = func() time.Time { return time.Unix(1700000000, 0).UTC() }
 		addTestIndexEntry(t, o, 1)
 		o.lock()
 		if err := o.saveIndexLocked(durable); err != nil {

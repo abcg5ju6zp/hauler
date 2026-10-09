@@ -27,6 +27,7 @@ import (
 	"hauler.dev/go/hauler/v2/internal/server"
 	gitartifact "hauler.dev/go/hauler/v2/pkg/artifacts/git"
 	"hauler.dev/go/hauler/v2/pkg/consts"
+	"hauler.dev/go/hauler/v2/pkg/content"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/reference"
 	"hauler.dev/go/hauler/v2/pkg/store"
@@ -136,12 +137,17 @@ func ServeRegistryCmd(ctx context.Context, o *flags.ServeRegistryOpts, s *store.
 		return err
 	}
 
+	// CopyCmd holds one snapshot read lease for the whole population: a
+	// concurrent store remove/GC in another process blocks until the
+	// population finishes, so the registry can never be seeded with a manifest
+	// whose blob is already gone (or a referrer whose subject is missing).
 	opts := &flags.CopyOpts{StoreRootOpts: rso, PlainHTTP: true}
 	if err := CopyCmd(ctx, opts, s, "registry://"+tr.Registry(), ro); err != nil {
 		return err
 	}
 
 	tr.Close()
+	l.Debugf("registry population read snapshot generation [%d]", s.Info().Generation)
 
 	// an empty store still serves, the same as fileserver and git
 	empty, err := storeEmpty(s)
@@ -205,6 +211,12 @@ func ServeFilesCmd(ctx context.Context, o *flags.ServeFilesOpts, s *store.Layout
 		return err
 	}
 
+	// Recovery: serve owns this backend directory; remove residue of an
+	// interrupted extraction so it can never be served as content.
+	if removed := content.SweepMatchingRecursive(o.RootDir, content.ExtractTempMatch); removed > 0 {
+		log.FromContext(ctx).Warnf("removed [%d] leftover extraction staging director(ies) from [%s]", removed, o.RootDir)
+	}
+
 	opts := &flags.CopyOpts{StoreRootOpts: &flags.StoreRootOpts{}}
 	if err := CopyCmd(ctx, opts, s, "directory://"+o.RootDir, ro); err != nil {
 		return err
@@ -244,6 +256,12 @@ func ServeGitCmd(ctx context.Context, o *flags.ServeGitOpts, s *store.Layout, ro
 
 	if err := validateStoreExists(s); err != nil {
 		return err
+	}
+
+	// Recovery: serve owns this backend directory; remove residue of an
+	// interrupted extraction so it can never be served as a git repository.
+	if removed := content.SweepMatchingRecursive(o.RootDir, content.ExtractTempMatch); removed > 0 {
+		log.FromContext(ctx).Warnf("removed [%d] leftover extraction staging director(ies) from [%s]", removed, o.RootDir)
 	}
 
 	repos, err := extractGitRepos(ctx, s, o.RootDir, ro)

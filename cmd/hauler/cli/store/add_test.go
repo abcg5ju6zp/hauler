@@ -809,11 +809,12 @@ func TestStoreImage(t *testing.T) {
 	})
 }
 
-// TestStoreImageIgnoreErrorsRelatedArtifactWording verifies that when the
-// image itself lands in the store but a related-artifact probe fails (e.g. a
-// 401 on the cosign tag convention), --ignore-errors reports that the image
-// was stored -- not the generic "unable to add image ... skipping" wording,
-// which would misreport that nothing was written.
+// TestStoreImageIgnoreErrorsRelatedArtifactWording verifies the atomic-snapshot
+// semantics: when a related-artifact probe fails (e.g. a 401 on the cosign tag
+// convention), AddImage rolls the WHOLE transition back -- the image is not
+// half-published without the sigs/referrers that belong with it. With
+// --ignore-errors storeImage reports the skip with the standard wording and no
+// error; the store stays empty so a retry can add the image whole.
 func TestStoreImageIgnoreErrorsRelatedArtifactWording(t *testing.T) {
 	host, opts := artifactProbe401Registry(t)
 	seedImage(t, host, "repro/warn", "v1", opts...)
@@ -832,15 +833,22 @@ func TestStoreImageIgnoreErrorsRelatedArtifactWording(t *testing.T) {
 	}
 
 	out := buf.String()
-	if !strings.Contains(out, "stored, but") {
-		t.Fatalf("warning does not say the image was stored; got: %s", out)
-	}
-	if strings.Contains(out, "unable to add image") {
-		t.Fatalf("misleading 'unable to add image' still logged for a related-artifact failure; got: %s", out)
+	if !strings.Contains(out, "unable to add image") {
+		t.Fatalf("expected a skip warning for the atomically rolled-back add; got: %s", out)
 	}
 
-	// The image itself must be in the store.
-	assertArtifactInStore(t, s, "repro/warn")
+	// The whole add was rolled back: no half-published image without its
+	// related artifacts.
+	n := 0
+	if err := s.Walk(func(_ string, _ ocispec.Descriptor) error {
+		n++
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("atomic add rolled back, but store contains %d artifact(s)", n)
+	}
 }
 
 func TestStoreImage_Rewrite(t *testing.T) {

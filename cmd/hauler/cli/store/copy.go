@@ -45,6 +45,18 @@ func CopyCmd(ctx context.Context, o *flags.CopyOpts, s *store.Layout, targetRef 
 
 	ignoreErrors := flags.ShouldIgnoreErrors(ro)
 
+	// One read lease for the whole copy, regardless of target type. The index
+	// walk and every blob fetch/push below observe the same snapshot: a
+	// concurrent remove/GC in this or another process waits for this copy to
+	// finish instead of unlinking a blob between manifest resolution and its
+	// fetch. This is the boundary that keeps `hauler store serve`'s registry
+	// population internally consistent.
+	view, err := s.View(ctx)
+	if err != nil {
+		return err
+	}
+	defer view.Release()
+
 	components := strings.SplitN(targetRef, "://", 2)
 	switch components[0] {
 	case "directory", "dir":

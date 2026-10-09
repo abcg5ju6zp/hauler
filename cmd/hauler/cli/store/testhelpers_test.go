@@ -632,15 +632,25 @@ func seedOCI11Referrer(t *testing.T, host, repo string, baseImg gcrv1.Image, opt
 }
 
 // seedStoreDescriptor injects a descriptor with the given annotations directly
-// into the store index without requiring a real registry or blob. This is used
-// to pre-populate the store for rewriteReference unit tests.
+// into the store index without requiring a real registry. A placeholder blob
+// is materialized at the descriptor's content path so the snapshot commit
+// validation (which rejects an index entry referencing a missing blob) passes.
+// The media type is a non-manifest type so no descriptor graph is decoded;
+// these tests exercise index/annotation mechanics, not content.
 func seedStoreDescriptor(t *testing.T, s *store.Layout, annotations map[string]string) {
 	t.Helper()
 	desc := ocispec.Descriptor{
-		MediaType:   ocispec.MediaTypeImageManifest,
+		MediaType:   "application/vnd.hauler.test.blob",
 		Digest:      digest.Digest("sha256:" + strings.Repeat("a", 64)),
 		Size:        1,
 		Annotations: annotations,
+	}
+	blobPath := filepath.Join(s.Root, ocispec.ImageBlobsDir, "sha256", strings.Repeat("a", 64))
+	if err := os.MkdirAll(filepath.Dir(blobPath), 0o755); err != nil {
+		t.Fatalf("seedStoreDescriptor mkdir: %v", err)
+	}
+	if err := os.WriteFile(blobPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seedStoreDescriptor write blob: %v", err)
 	}
 	if err := s.OCI.AddIndex(desc); err != nil {
 		t.Fatalf("seedStoreDescriptor: %v", err)

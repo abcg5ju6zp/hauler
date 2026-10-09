@@ -847,14 +847,10 @@ func storeImage(ctx context.Context, s *store.Layout, i v1.Image, platform strin
 	})
 	if err != nil {
 		if ignoreErrors {
-			var raErr *store.RelatedArtifactError
-			if errors.As(err, &raErr) {
-				// The image itself already landed in the store before the
-				// artifact probe failed; "unable to add image" would
-				// misreport what's actually there.
-				log.BaseFromContext(ctx).Warnf("image [%s] stored, but retrieving related artifacts failed: %v... continuing...", effectiveRef.Name(), err)
-				return nil
-			}
+			// AddImage is one atomic snapshot transition (image plus every
+			// sig/att/sbom/referrer): a related-artifact failure rolls the
+			// whole add back rather than leaving an image without the
+			// artifacts that belong to it. Skip it; a retry re-adds it whole.
 			log.BaseFromContext(ctx).Warnf("unable to add image [%s] to store: %v... skipping...", effectiveRef.Name(), err)
 			return nil
 		} else if errors.Is(err, context.Canceled) {

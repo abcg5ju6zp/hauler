@@ -46,6 +46,11 @@ type Layout struct {
 	haulerDir string
 	cache     layer.Cache
 
+	// sweep is the crash-recovery outcome from opening this layout: residual
+	// temporary objects recognized and removed (or deliberately skipped while
+	// another process held the store). Observable via LastSweep.
+	sweep content.SweepResult
+
 	// blobConcurrency overrides the OCI layout's default blob-write
 	// concurrency ceiling (content.OCI.blobSem) when > 0. Set via
 	// WithBlobConcurrency; must be known before content.NewOCI is called, so
@@ -79,8 +84,19 @@ func WithBlobConcurrency(n int) Options {
 }
 
 func NewLayout(rootdir string, opts ...Options) (*Layout, error) {
+	// Recovery first: while no other process can hold a lease, sweep the
+	// recognizable residue of interrupted updates (blob/index/metadata temps
+	// and staging dirs) so a reopened store can never surface it. When another
+	// process is live the sweep is skipped (Skipped=true) and that process's
+	// exit leaves the sweep to a later open.
+	sweep := content.SweepTemp(rootdir)
+	if sweep.Removed > 0 {
+		zlog.Info().Int("removed", sweep.Removed).Str("root", rootdir).Msg("snapshot recovery removed residual temporary objects from store")
+	}
+
 	l := &Layout{
 		Root:    rootdir,
+		sweep:   sweep,
 		StoreID: loadOrCreateStoreID(rootdir),
 	}
 
@@ -106,6 +122,54 @@ func NewLayout(rootdir string, opts ...Options) (*Layout, error) {
 	}
 
 	return l, nil
+}
+
+// LastSweep reports the crash-recovery sweep performed when this layout was
+// opened: Removed counts residual temporary objects deleted, Skipped means a
+// live process held the store and nothing was touched.
+func (l *Layout) LastSweep() content.SweepResult {
+	return l.sweep
+}
+
+// SnapshotInfo is the observable identity of the store's current snapshot.
+type SnapshotInfo struct {
+	// Generation is index.json's monotonically increasing snapshot counter.
+	Generation uint64
+	// Time is the committed snapshot's RFC3339Nano timestamp ("" for stores
+	// written before snapshot generations existed).
+	Time string
+	// Artifacts is the number of catalogued descriptors currently held.
+	Artifacts int
+}
+
+// SnapshotInfo returns the store's current snapshot identity.
+func (l *Layout) Info() SnapshotInfo {
+	gen, ts, count := l.OCI.SnapshotInfo()
+	return SnapshotInfo{Generation: gen, Time: ts, Artifacts: count}
+}
+
+// Update runs fn as one all-or-nothing snapshot transition. fn stages index
+// changes on tx while writing blobs through the layout as usual; if fn returns
+// an error (or commit-time validation fails), nothing is published -- no
+// manifest, blob reference, or referrer becomes visible without the rest of
+// the logical update. On success the whole transition is one new generation.
+func (l *Layout) Update(ctx context.Context, fn func(tx *content.Txn) error) (uint64, error) {
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	return tx.Commit()
+}
+
+// View acquires a read lease pinned to one committed snapshot. Hold it across
+// the whole request (index walk plus every blob fetch/push); deletion waits
+// for Release instead of unlinking in-use blobs.
+func (l *Layout) View(ctx context.Context) (*content.SnapshotView, error) {
+	return l.OCI.View(ctx)
 }
 
 type storeMetadata struct {
@@ -143,17 +207,20 @@ func loadOrCreateStoreID(rootdir string) string {
 	}
 
 	fl := flock.New(metaPath + ".lock")
-	ctx, cancel := context.WithTimeout(context.Background(), storeIDLockTimeout)
-	locked, err := fl.TryLockContext(ctx, 50*time.Millisecond)
+	lockCtx, cancel := context.WithTimeout(context.Background(), storeIDLockTimeout)
+	locked, lockErr := fl.TryLockContext(lockCtx, 50*time.Millisecond)
 	cancel()
-	if err != nil || !locked {
-		zlog.Warn().Err(err).Msg("failed to lock store metadata... a concurrent process may generate a conflicting store id")
+	if lockErr != nil || !locked {
+		zlog.Warn().Err(lockErr).Msg("failed to lock store metadata... a concurrent process may generate a conflicting store id")
 	} else {
 		defer fl.Unlock()
 		// a concurrent process may have created store.json while we waited for the lock
 		if id, ok := readStoreID(metaPath); ok {
 			return id
 		}
+		// We are the sole store.json writer (lock held): any store-*.json.tmp
+		// here is residue of a crashed creator -- sweep it before writing.
+		content.SweepMatching(rootdir, content.MetaTempMatch)
 	}
 
 	m := storeMetadata{
@@ -165,12 +232,31 @@ func loadOrCreateStoreID(rootdir string) string {
 		zlog.Warn().Err(err).Msg("failed to marshal store metadata... store id will not persist across runs")
 		return m.StoreID
 	}
-	tmp := metaPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		zlog.Warn().Err(err).Str("path", tmp).Msg("failed to write store metadata... store id will not persist across runs")
+	// Unique temp name matching the snapshot boundary's recognized pattern, so
+	// crash residue is swept on the next NewLayout instead of lingering (or
+	// racing a sibling process on a fixed ".tmp" name).
+	tmp, err := os.CreateTemp(filepath.Dir(metaPath), "store-*"+consts.SnapshotIndexTempSuffix)
+	if err != nil {
+		zlog.Warn().Err(err).Msg("failed to write store metadata... store id will not persist across runs")
 		return m.StoreID
 	}
-	if err := os.Rename(tmp, metaPath); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		zlog.Warn().Err(err).Msg("failed to write store metadata... store id will not persist across runs")
+		return m.StoreID
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		zlog.Warn().Err(err).Msg("failed to write store metadata... store id will not persist across runs")
+		return m.StoreID
+	}
+	if err := tmp.Close(); err != nil {
+		zlog.Warn().Err(err).Msg("failed to write store metadata... store id will not persist across runs")
+		return m.StoreID
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
 		zlog.Warn().Err(err).Str("path", metaPath).Msg("failed to write store metadata... store id will not persist across runs")
 	}
 	return m.StoreID
@@ -183,6 +269,25 @@ func loadOrCreateStoreID(rootdir string) string {
 //	strict types to define generic content, but provides a processing pipeline suitable for extensibility.  In the
 //	future we'll allow users to define their own content that must adhere either by artifact.OCI or simply an OCI layout.
 func (l *Layout) AddArtifact(ctx context.Context, oci artifacts.OCI, ref string) (ocispec.Descriptor, error) {
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	idx, err := l.addArtifactIntoTx(ctx, tx, oci, ref)
+	if err != nil {
+		tx.Rollback()
+		return ocispec.Descriptor{}, err
+	}
+	if _, err := tx.Commit(); err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	return idx, nil
+}
+
+// addArtifactIntoTx stages one artifact's blobs and index descriptor into tx
+// without committing. Shared by AddArtifact and AddArtifactCollection so a
+// collection publishes as a single snapshot.
+func (l *Layout) addArtifactIntoTx(ctx context.Context, tx *content.Txn, oci artifacts.OCI, ref string) (ocispec.Descriptor, error) {
 	if l.cache != nil {
 		cached := layer.OCICache(oci, l.cache)
 		oci = cached
@@ -263,23 +368,32 @@ func (l *Layout) AddArtifact(ctx context.Context, oci artifacts.OCI, ref string)
 		Platform: nil,
 	}
 
-	return idx, l.OCI.AddIndex(idx)
+	return idx, tx.AddIndex(idx)
 }
 
-// AddArtifactCollection .
+// AddArtifactCollection publishes the whole collection as one snapshot.
 func (l *Layout) AddArtifactCollection(ctx context.Context, collection artifacts.OCICollection) ([]ocispec.Descriptor, error) {
 	cnts, err := collection.Contents()
 	if err != nil {
 		return nil, err
 	}
 
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var descs []ocispec.Descriptor
 	for ref, oci := range cnts {
-		desc, err := l.AddArtifact(ctx, oci, ref)
+		desc, err := l.addArtifactIntoTx(ctx, tx, oci, ref)
 		if err != nil {
+			tx.Rollback()
 			return nil, err
 		}
 		descs = append(descs, desc)
+	}
+	if _, err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return descs, nil
 }
@@ -342,13 +456,29 @@ func (l *Layout) AddImage(ctx context.Context, ref string, platform string, excl
 	// platform-filtered and single-arch paths, which stay single-subject.
 	var savedIdx v1.ImageIndex
 
+	// The image and every one of its sig/att/sbom/referrers are one snapshot
+	// transition: the transaction's shared lease protects staged blobs from
+	// GC while the (possibly long) pulls run, and Commit publishes them all at
+	// once. A failure anywhere in this chain rolls the whole add back, so a
+	// reader never observes the base manifest without its referrers.
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
 	if idx, idxErr := desc.ImageIndex(); idxErr == nil && platform == "" {
 		// Multi-arch image with no platform filter: save the full index.
 		imageDigest, err = idx.Digest()
 		if err != nil {
 			return "", fmt.Errorf("getting index digest for %q: %w", ref, err)
 		}
-		if err := l.writeIndex(ctx, parsedRef, idx, consts.KindAnnotationIndex, ""); err != nil {
+		if err := l.writeIndex(ctx, tx, parsedRef, idx, consts.KindAnnotationIndex, ""); err != nil {
 			return "", err
 		}
 		savedIdx = idx
@@ -379,7 +509,7 @@ func (l *Layout) AddImage(ctx context.Context, ref string, platform string, excl
 		if err != nil {
 			return "", fmt.Errorf("getting image digest for %q: %w", ref, err)
 		}
-		if err := l.writeImage(ctx, parsedRef, img, consts.KindAnnotationImage, "", ""); err != nil {
+		if err := l.writeImage(ctx, tx, parsedRef, img, consts.KindAnnotationImage, "", ""); err != nil {
 			return "", err
 		}
 	}
@@ -400,14 +530,18 @@ func (l *Layout) AddImage(ctx context.Context, ref string, platform string, excl
 		saved := make(map[string]bool)
 		for i, subject := range subjects {
 			topLevel := i == 0
-			if err := l.saveRelatedArtifacts(ctx, parsedRef, subject, topLevel, saved, allOpts...); err != nil {
+			if err := l.saveRelatedArtifacts(ctx, tx, parsedRef, subject, topLevel, saved, allOpts...); err != nil {
 				return "", err
 			}
-			if err := l.saveReferrers(ctx, parsedRef, subject, saved, allOpts...); err != nil {
+			if err := l.saveReferrers(ctx, tx, parsedRef, subject, saved, allOpts...); err != nil {
 				return "", err
 			}
 		}
 	}
+	if _, err := tx.Commit(); err != nil {
+		return "", err
+	}
+	committed = true
 	return imageDigest.String(), nil
 }
 
@@ -433,7 +567,15 @@ func (l *Layout) AddLocalImage(ctx context.Context, ref string) (string, error) 
 		return "", fmt.Errorf("getting image digest for %q: %w", ref, err)
 	}
 
-	if err := l.writeImage(ctx, parsedRef, img, consts.KindAnnotationImage, "", ""); err != nil {
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := l.writeImage(ctx, tx, parsedRef, img, consts.KindAnnotationImage, "", ""); err != nil {
+		tx.Rollback()
+		return "", err
+	}
+	if _, err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return d.String(), nil
@@ -515,11 +657,13 @@ func (l *Layout) writeImageBlobs(ctx context.Context, img v1.Image) error {
 	return l.writeBlobData(ctx, manifestData)
 }
 
-// writeImage writes all blobs for img and adds a descriptor entry to the OCI index with the
-// given annotationRef and kind. containerdName overrides the io.containerd.image.name annotation;
-// if empty it defaults to annotationRef.Name(). A non-empty subjectDigest records the base
-// image's digest this artifact is a sig/att/sbom/referrer of; empty omits the annotation.
-func (l *Layout) writeImage(ctx context.Context, annotationRef goname.Reference, img v1.Image, kind string, containerdName string, subjectDigest string) error {
+// writeImage writes all blobs for img and stages a descriptor entry into tx
+// with the given annotationRef and kind (nothing is published until the tx
+// commits). containerdName overrides the io.containerd.image.name annotation;
+// if empty it defaults to annotationRef.Name(). A non-empty subjectDigest
+// records the base image's digest this artifact is a sig/att/sbom/referrer of;
+// empty omits the annotation.
+func (l *Layout) writeImage(ctx context.Context, tx *content.Txn, annotationRef goname.Reference, img v1.Image, kind string, containerdName string, subjectDigest string) error {
 	if err := l.writeImageBlobs(ctx, img); err != nil {
 		return err
 	}
@@ -564,7 +708,7 @@ func (l *Layout) writeImage(ctx context.Context, annotationRef goname.Reference,
 	if subjectDigest != "" {
 		desc.Annotations[consts.SubjectDigestAnnotation] = subjectDigest
 	}
-	return l.OCI.AddIndex(desc)
+	return tx.AddIndex(desc)
 }
 
 // collectSubjectDigests returns the index's own digest followed by every
@@ -645,11 +789,11 @@ func (l *Layout) writeIndexBlobs(ctx context.Context, idx v1.ImageIndex) error {
 	return nil
 }
 
-// writeIndex writes all blobs for an image index (including all child platform images) and adds
-// a descriptor entry to the OCI index with the given annotationRef and kind. subjectDigest follows
-// the same rule as writeImage's -- OCI 1.1 permits subject on image indexes too, so a referrer can
-// itself be an index.
-func (l *Layout) writeIndex(ctx context.Context, annotationRef goname.Reference, idx v1.ImageIndex, kind string, subjectDigest string) error {
+// writeIndex writes all blobs for an image index (including all child platform images) and
+// stages a descriptor entry into tx with the given annotationRef and kind; nothing is
+// published until the tx commits. subjectDigest follows the same rule as writeImage's --
+// OCI 1.1 permits subject on image indexes too, so a referrer can itself be an index.
+func (l *Layout) writeIndex(ctx context.Context, tx *content.Txn, annotationRef goname.Reference, idx v1.ImageIndex, kind string, subjectDigest string) error {
 	if err := l.writeIndexBlobs(ctx, idx); err != nil {
 		return err
 	}
@@ -691,7 +835,7 @@ func (l *Layout) writeIndex(ctx context.Context, annotationRef goname.Reference,
 	if subjectDigest != "" {
 		desc.Annotations[consts.SubjectDigestAnnotation] = subjectDigest
 	}
-	return l.OCI.AddIndex(desc)
+	return tx.AddIndex(desc)
 }
 
 // isNotFound reports whether err is a definitive "artifact absent" registry
@@ -735,7 +879,7 @@ func (e *RelatedArtifactError) Unwrap() error { return e.Err }
 // saveReferrers discovers and saves OCI 1.1 referrers for the image identified by ref/subject --
 // cosign v3 new-bundle-format sigs/attestations stored via the subject field, as opposed to the
 // legacy sha256-<hex>.sig/.att/.sbom tag convention.
-func (l *Layout) saveReferrers(ctx context.Context, ref goname.Reference, subject v1.Hash, alreadySaved map[string]bool, opts ...remote.Option) error {
+func (l *Layout) saveReferrers(ctx context.Context, tx *content.Txn, ref goname.Reference, subject v1.Hash, alreadySaved map[string]bool, opts ...remote.Option) error {
 	log := zerolog.Ctx(ctx)
 
 	imageDigestRef, err := goname.NewDigest(ref.Context().String() + "@" + subject.String())
@@ -800,7 +944,7 @@ func (l *Layout) saveReferrers(ctx context.Context, ref goname.Reference, subjec
 				}
 				return &RelatedArtifactError{Ref: ref.Name(), Kind: kind, Subject: subject.String(), Err: err}
 			}
-			if err := l.writeIndex(ctx, ref, refIdx, kind, subject.String()); err != nil {
+			if err := l.writeIndex(ctx, tx, ref, refIdx, kind, subject.String()); err != nil {
 				return fmt.Errorf("saving OCI referrer index %s for %s: %w", referrerDesc.Digest, ref.Name(), err)
 			}
 		case types.OCIManifestSchema1, types.DockerManifestSchema2:
@@ -812,7 +956,7 @@ func (l *Layout) saveReferrers(ctx context.Context, ref goname.Reference, subjec
 				}
 				return &RelatedArtifactError{Ref: ref.Name(), Kind: kind, Subject: subject.String(), Err: err}
 			}
-			if err := l.writeImage(ctx, ref, img, kind, "", subject.String()); err != nil {
+			if err := l.writeImage(ctx, tx, ref, img, kind, "", subject.String()); err != nil {
 				return fmt.Errorf("saving OCI referrer %s for %s: %w", referrerDesc.Digest, ref.Name(), err)
 			}
 		default:
@@ -832,7 +976,7 @@ func (l *Layout) saveReferrers(ctx context.Context, ref goname.Reference, subjec
 // first. saved is shared across all subjects of one AddImage call so a
 // manifest reachable via both the tag convention and the Referrers API is
 // stored once.
-func (l *Layout) saveRelatedArtifacts(ctx context.Context, ref goname.Reference, subject v1.Hash, topLevel bool, saved map[string]bool, opts ...remote.Option) error {
+func (l *Layout) saveRelatedArtifacts(ctx context.Context, tx *content.Txn, ref goname.Reference, subject v1.Hash, topLevel bool, saved map[string]bool, opts ...remote.Option) error {
 	tagPrefix := strings.ReplaceAll(subject.String(), ":", "-")
 
 	related := []struct {
@@ -860,7 +1004,7 @@ func (l *Layout) saveRelatedArtifacts(ctx context.Context, ref goname.Reference,
 		if !topLevel {
 			kind = r.kind + "/" + subject.Hex
 		}
-		if err := l.writeImage(ctx, ref, img, kind, "", subject.String()); err != nil {
+		if err := l.writeImage(ctx, tx, ref, img, kind, "", subject.String()); err != nil {
 			return fmt.Errorf("saving %s for %s: %w", kind, ref.Name(), err)
 		}
 		if d, err := img.Digest(); err == nil {
@@ -887,23 +1031,34 @@ func parsePlatform(s string) (v1.Platform, error) {
 //
 //	This can be a highly destructive operation if the store's directory happens to be inline with other non-store contents
 //	To reduce the blast radius and likelihood of deleting things we don't own, Flush explicitly deletes oci-layout content only
+//
+// Flush runs behind the exclusive snapshot boundary: in-flight reads finish
+// first, and the index removal, blob unlink, and in-memory reset happen as one
+// state change. Recognizable crash residue (temps/staging) is swept too.
 func (l *Layout) Flush(ctx context.Context) error {
-	blobs := filepath.Join(l.Root, ocispec.ImageBlobsDir)
-	if err := os.RemoveAll(blobs); err != nil {
-		return err
-	}
+	return l.OCI.Exclusive(ctx, func() error {
+		blobs := filepath.Join(l.Root, ocispec.ImageBlobsDir)
+		if err := os.RemoveAll(blobs); err != nil {
+			return err
+		}
 
-	index := filepath.Join(l.Root, ocispec.ImageIndexFile)
-	if err := os.RemoveAll(index); err != nil {
-		return err
-	}
+		index := filepath.Join(l.Root, ocispec.ImageIndexFile)
+		if err := os.RemoveAll(index); err != nil {
+			return err
+		}
 
-	layout := filepath.Join(l.Root, ocispec.ImageLayoutFile)
-	if err := os.RemoveAll(layout); err != nil {
-		return err
-	}
+		layout := filepath.Join(l.Root, ocispec.ImageLayoutFile)
+		if err := os.RemoveAll(layout); err != nil {
+			return err
+		}
 
-	return nil
+		// Remove residue of interrupted updates as well.
+		content.SweepMatching(l.Root, content.IndexTempMatch, content.MetaTempMatch, content.StagingTempMatch)
+		content.SweepMatching(filepath.Join(l.Root, ocispec.ImageBlobsDir, digest.Canonical.String()), content.BlobTempMatch)
+
+		l.OCI.ResetState()
+		return nil
+	})
 }
 
 // Copy will copy a given reference to a given content.Target
@@ -1092,9 +1247,20 @@ func (l *Layout) pushData(ctx context.Context, desc ocispec.Descriptor, data []b
 }
 
 // CopyAll performs bulk copy operations on the stores oci layout to a provided target
+//
+// The whole copy runs under one read lease (snapshot view): the index is
+// walked once and every descriptor graph is fetched from that same snapshot,
+// so a concurrent remove/GC in this or another process waits for the copy to
+// finish instead of deleting a blob between manifest resolution and its fetch.
 func (l *Layout) CopyAll(ctx context.Context, to content.Target, toMapper func(string) (string, error)) ([]ocispec.Descriptor, error) {
+	view, err := l.OCI.View(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer view.Release()
+
 	var descs []ocispec.Descriptor
-	err := l.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
+	err = l.OCI.Walk(func(reference string, desc ocispec.Descriptor) error {
 		// Use the clean reference from annotations (without -kind suffix) as the base
 		// The reference parameter from Walk is the nameMap key with format "ref-kind",
 		// but we need the clean ref for the destination to avoid double-appending kind
@@ -1183,17 +1349,68 @@ func (l *Layout) writeLayer(ctx context.Context, layer v1.Layer) error {
 	})
 }
 
-// Remove artifact reference from the store
+// RemoveArtifact removes one artifact reference as a single snapshot
+// transition. It does not garbage-collect unreferenced blobs; callers removing
+// a batch and wanting immediate GC use RemoveArtifacts.
 func (l *Layout) RemoveArtifact(ctx context.Context, reference string, desc ocispec.Descriptor) error {
-	if err := l.OCI.LoadIndex(); err != nil {
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
 		return err
 	}
-
-	l.OCI.RemoveFromIndex(reference)
-	return l.OCI.SaveIndex()
+	tx.Remove(reference)
+	if tx.Empty() {
+		tx.Rollback()
+		return nil
+	}
+	_, err = tx.Commit()
+	return err
 }
 
+// RemoveArtifacts removes every reference key as one index transition and then
+// garbage-collects unreferenced blobs within the SAME exclusive snapshot
+// boundary. A reader therefore observes either the old snapshot (entries plus
+// all blobs) or the new snapshot (entries gone, unreferenced blobs unlinked),
+// never a manifest entry whose blob has already been deleted.
+func (l *Layout) RemoveArtifacts(ctx context.Context, references []string) (generation uint64, deletedCount int, deletedSize int64, err error) {
+	tx, err := l.OCI.BeginTx(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for _, reference := range references {
+		tx.Remove(reference)
+	}
+	if tx.Empty() {
+		tx.Rollback()
+	} else {
+		generation, err = tx.Commit()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+	}
+
+	deletedCount, deletedSize, err = l.CleanUp(ctx)
+	return generation, deletedCount, deletedSize, err
+}
+
+// CleanUp garbage-collects blobs no longer reachable from the committed
+// snapshot. It runs behind the exclusive boundary so concurrent reads finish
+// before any blob is unlinked and a concurrent updater can't have its staged,
+// not-yet-indexed blobs reaped (a staging transaction holds the shared lease
+// GC waits for).
 func (l *Layout) CleanUp(ctx context.Context) (int, int64, error) {
+	var deletedCount int
+	var deletedSize int64
+	err := l.OCI.Exclusive(ctx, func() error {
+		var gerr error
+		deletedCount, deletedSize, gerr = l.gcLocked(ctx)
+		return gerr
+	})
+	return deletedCount, deletedSize, err
+}
+
+// gcLocked is CleanUp's implementation. Callers must hold the exclusive
+// snapshot boundary (see CleanUp).
+func (l *Layout) gcLocked(ctx context.Context) (int, int64, error) {
 	referencedDigests := make(map[string]bool)
 
 	if err := l.OCI.LoadIndex(); err != nil {

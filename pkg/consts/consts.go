@@ -95,6 +95,27 @@ const (
 	// would be routed to the top-level index's tag.
 	SubjectDigestAnnotation = "hauler.dev/subject-digest"
 
+	// SnapshotGenerationAnnotation and SnapshotTimeAnnotation are recorded on
+	// index.json itself (top-level index annotations, not per-descriptor) and
+	// identify the committed snapshot a reader observes. Generation is a
+	// monotonically increasing counter bumped on every committed index
+	// transition; Time is the commit timestamp in RFC3339 UTC. Together they
+	// are the "recognizable snapshot boundary" shared by serve, the OCI layout,
+	// inventory, validation, deletion, and crash recovery.
+	SnapshotGenerationAnnotation = "hauler.dev/snapshot-generation"
+	SnapshotTimeAnnotation       = "hauler.dev/snapshot-time"
+
+	// SnapshotLockDir/SnapshotLockFile name the advisory lock that coordinates
+	// snapshot views (shared) with commits and blob deletion (exclusive) across
+	// hauler processes sharing one store root.
+	SnapshotLockDir  = ".hauler"
+	SnapshotLockFile = "snapshot.lock"
+	// SnapshotCommitLockFile serializes index.json read-modify-write commits
+	// across processes. It is deliberately a second lock: snapshot.lock's
+	// shared/exclusive barrier coordinates readers and blob deletion, while
+	// commits must only exclude each other, never readers.
+	SnapshotCommitLockFile = "commit.lock"
+
 	// cosign keyless validation options
 	ImageAnnotationCertIdentity                 = "hauler.dev/certificate-identity"
 	ImageAnnotationCertIdentityRegexp           = "hauler.dev/certificate-identity-regexp"
@@ -167,6 +188,22 @@ const (
 	DefaultHaulerManifestName        = "hauler-manifest.yaml"
 	DefaultStoreMetadataName         = "store.json"
 	DefaultStoreInventoryName        = "stores.json"
+
+	// Snapshot temporary-object naming. Every component that stages data under
+	// a store root (index rewrite, blob ingest, store metadata) or under a
+	// serve backend root (directory extraction) MUST use one of these patterns,
+	// so crash recovery can recognize residue by name and sweep it. Nothing
+	// matching these patterns is ever read as committed content: blob readers
+	// only open exact <hex> digest names and the OCI catalog is exactly
+	// index.json. The patterns are deliberately conservative (fixed prefixes/
+	// suffixes) so the sweep can never match a committed object.
+	SnapshotIndexTempPrefix     = "index-"
+	SnapshotIndexTempSuffix     = ".json.tmp"
+	SnapshotBlobTempSegment     = ".tmp-" // blob temps: "<hex>.tmp-*"
+	SnapshotStagingPrefix       = ".hauler-staging-"
+	SnapshotMetaTempPrefix      = "store-" // store metadata temp: "store-*.json.tmp"
+	SnapshotInventoryTempPrefix = "stores-"
+	SnapshotExtractTempSegment  = ".hauler-extract-" // ".<base>.hauler-extract-*"
 	DefaultRetries                   = 3
 	RetriesInterval                  = 5
 	DefaultConcurrency               = 5

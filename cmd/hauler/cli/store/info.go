@@ -20,12 +20,26 @@ import (
 )
 
 type infoOutput struct {
-	StorePath string `json:"store-path"`
-	StoreID   string `json:"store-id"`
-	Artifacts []item `json:"artifacts"`
+	StorePath           string `json:"store-path"`
+	StoreID             string `json:"store-id"`
+	SnapshotGeneration  uint64 `json:"snapshot-generation"`
+	SnapshotTime        string `json:"snapshot-time,omitempty"`
+	Artifacts           []item `json:"artifacts"`
 }
 
 func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
+	// One read lease for the whole listing/check: manifests, configs, and
+	// layers of every row are observed from the same snapshot, so a concurrent
+	// remove/GC can't make a row's blob disappear between the manifest fetch
+	// and its integrity check.
+	view, err := s.View(ctx)
+	if err != nil {
+		return err
+	}
+	defer view.Release()
+
+	snap := s.Info()
+
 	var checker *store.Checker
 	if o.Check {
 		checker = s.NewChecker()
@@ -275,9 +289,11 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 	switch o.OutputFormat {
 	case "json":
 		out := infoOutput{
-			StorePath: s.Root,
-			StoreID:   s.StoreID,
-			Artifacts: items,
+			StorePath:          s.Root,
+			StoreID:            s.StoreID,
+			SnapshotGeneration: snap.Generation,
+			SnapshotTime:       snap.Time,
+			Artifacts:          items,
 		}
 		data, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {

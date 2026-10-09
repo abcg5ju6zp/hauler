@@ -290,7 +290,19 @@ func unarchiveLayoutTo(ctx context.Context, haulPath string, dest string, tempDi
 		return err
 	}
 
-	if _, err := s.CopyAll(ctx, ts, nil); err != nil {
+	// Commit the whole haul as one snapshot: every descriptor it carries is
+	// buffered through tx and published by a single index.json transition, so
+	// a failure mid-haul (or a commit-time validation failure) leaves the
+	// previously committed store untouched instead of exposing a partial load.
+	tx, err := ts.BeginTx(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.CopyAll(ctx, tx.Target(), nil); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Commit(); err != nil {
 		return err
 	}
 

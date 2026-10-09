@@ -17,11 +17,45 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	gvtypes "github.com/google/go-containerregistry/pkg/v1/types"
+	goname "github.com/google/go-containerregistry/pkg/name"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/reference"
 )
+
+// commitWriteImage runs writeImage inside one snapshot transaction and commits
+// it, mirroring how AddImage publishes through a Txn.
+func commitWriteImage(t *testing.T, l *Layout, ref goname.Reference, img gv1.Image, kind, containerdName, subject string) {
+	t.Helper()
+	tx, err := l.OCI.BeginTx(context.Background())
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if err := l.writeImage(context.Background(), tx, ref, img, kind, containerdName, subject); err != nil {
+		tx.Rollback()
+		t.Fatalf("writeImage: %v", err)
+	}
+	if _, err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+}
+
+// commitWriteIndex is the writeIndex counterpart to commitWriteImage.
+func commitWriteIndex(t *testing.T, l *Layout, ref goname.Reference, idx gv1.ImageIndex, kind, subject string) {
+	t.Helper()
+	tx, err := l.OCI.BeginTx(context.Background())
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if err := l.writeIndex(context.Background(), tx, ref, idx, kind, subject); err != nil {
+		tx.Rollback()
+		t.Fatalf("writeIndex: %v", err)
+	}
+	if _, err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+}
 
 func TestWriteImageNormalizesContainerdName(t *testing.T) {
 	l, err := NewLayout(t.TempDir())
@@ -36,10 +70,7 @@ func TestWriteImageNormalizesContainerdName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseReference: %v", err)
 	}
-	// ref.Name() is "index.docker.io/library/busybox:v1"; the annotation must not be.
-	if err := l.writeImage(context.Background(), ref, img, consts.KindAnnotationImage, "", ""); err != nil {
-		t.Fatalf("writeImage: %v", err)
-	}
+	commitWriteImage(t, l, ref, img, consts.KindAnnotationImage, "", "")
 
 	data, err := os.ReadFile(filepath.Join(l.Root, "index.json"))
 	if err != nil {
@@ -99,10 +130,7 @@ func TestWriteIndexNormalizesContainerdName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseReference: %v", err)
 	}
-	// ref.Name() is "index.docker.io/library/busybox@sha256:..."; the annotation must not be.
-	if err := l.writeIndex(context.Background(), ref, idx, consts.KindAnnotationIndex, ""); err != nil {
-		t.Fatalf("writeIndex: %v", err)
-	}
+	commitWriteIndex(t, l, ref, idx, consts.KindAnnotationIndex, "")
 
 	data, err := os.ReadFile(filepath.Join(l.Root, "index.json"))
 	if err != nil {
@@ -181,9 +209,7 @@ func TestWriteImageAnnotationRefNameIsRegistryless(t *testing.T) {
 			}
 			// containerdName "" mirrors AddImage (store.go), which lets writeImage
 			// derive both annotations from ref.
-			if err := l.writeImage(context.Background(), ref, img, consts.KindAnnotationImage, "", ""); err != nil {
-				t.Fatalf("writeImage: %v", err)
-			}
+			commitWriteImage(t, l, ref, img, consts.KindAnnotationImage, "", "")
 
 			data, err := os.ReadFile(filepath.Join(l.Root, "index.json"))
 			if err != nil {

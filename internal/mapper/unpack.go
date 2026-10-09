@@ -13,6 +13,7 @@ import (
 	"github.com/mholt/archives"
 	digest "github.com/opencontainers/go-digest"
 
+	"hauler.dev/go/hauler/v2/pkg/consts"
 	"hauler.dev/go/hauler/v2/pkg/log"
 )
 
@@ -66,7 +67,7 @@ func replaceDir(ctx context.Context, archivePath, dir string) error {
 		return fmt.Errorf("failed to create parent directory for [%s]: %w", dir, err)
 	}
 
-	staging, err := os.MkdirTemp(parent, "."+filepath.Base(dir)+".hauler-extract-")
+	staging, err := os.MkdirTemp(parent, "."+filepath.Base(dir)+consts.SnapshotExtractTempSegment)
 	if err != nil {
 		return fmt.Errorf("failed to create staging directory for [%s]: %w", dir, err)
 	}
