@@ -2,6 +2,8 @@ package archives
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -250,13 +252,29 @@ func JoinChunks(ctx context.Context, archivePath, tempDir string) (string, error
 			return idxI < idxJ
 		})
 
+		// The publication marker, when present, makes the set strictly
+		// verifiable: a half-published swap or a mix of generations is
+		// rejected here instead of joining into a plausible-but-truncated
+		// archive. Sets without one (older hauler) join best-effort as they
+		// always did.
+		manifest, manifestPresent, err := loadChunkManifest(base)
+		if err != nil {
+			return "", err
+		}
+
 		// A redundant chunk set carries its own header on every shard, so detection and repair happen transparently here regardless of how the caller asked to load the archive.
 		if ok, err := isRedundantChunkSet(matches); err != nil {
 			return "", fmt.Errorf("failed to inspect chunk set for redundancy: %w", err)
 		} else if ok {
-			return reconstructAndJoin(ctx, matches, tempDir, filepath.Base(base))
+			return reconstructAndJoin(ctx, matches, tempDir, filepath.Base(base), manifest)
 		}
 
+		if manifestPresent {
+			if err := assertChunkSetComplete(base, manifest); err != nil {
+				return "", fmt.Errorf("validating chunk set for [%s]: %w ... re-run `hauler store save` to recreate the set", filepath.Base(base), err)
+			}
+			return joinFilesVerified(ctx, matches, tempDir, filepath.Base(base), manifest)
+		}
 		return joinFiles(ctx, matches, tempDir, filepath.Base(base))
 	}
 
@@ -312,5 +330,60 @@ func joinFiles(ctx context.Context, matches []string, tempDir, joinedName string
 	}
 
 	l.Infof("joined %d chunk(s) into [%s]", len(matches), joinedName)
+	return joinedPath, nil
+}
+
+// joinFilesVerified is joinFiles for a set with a publication manifest: the
+// join is hashed as it is written and the resulting archive must match the
+// manifest's size and digest before its path is returned. A corrupt or
+// partially renamed chunk set fails here instead of producing an archive that
+// merely looks loadable.
+func joinFilesVerified(ctx context.Context, matches []string, tempDir, joinedName string, m *chunkManifest) (string, error) {
+	l := log.FromContext(ctx)
+	l.Debugf("joining and verifying %d chunk(s) into [%s]", len(matches), joinedName)
+
+	joinedPath := filepath.Join(tempDir, joinedName)
+	outf, err := os.Create(joinedPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create joined archive: %w", err)
+	}
+	sum := sha256.New()
+	writer := io.MultiWriter(outf, sum)
+	var total int64
+
+	abort := func(cause error) (string, error) {
+		outf.Close()
+		os.Remove(joinedPath)
+		return "", cause
+	}
+
+	for _, chunk := range matches {
+		l.Debugf("joining chunk [%s]", chunk)
+		cf, err := os.Open(chunk)
+		if err != nil {
+			return abort(fmt.Errorf("failed to open chunk [%s]: %w", chunk, err))
+		}
+		n, copyErr := io.Copy(writer, cf)
+		cf.Close()
+		if copyErr != nil {
+			return abort(fmt.Errorf("failed to copy chunk [%s]: %w", chunk, copyErr))
+		}
+		total += n
+	}
+	if err := outf.Close(); err != nil {
+		os.Remove(joinedPath)
+		return "", fmt.Errorf("failed to close joined archive: %w", err)
+	}
+
+	if total != m.ArchiveSize {
+		os.Remove(joinedPath)
+		return "", fmt.Errorf("%w: joined size %d does not match manifest size %d for [%s] ... re-run `hauler store save` to recreate the set", ErrIncompleteChunkSet, total, m.ArchiveSize, joinedName)
+	}
+	if got := "sha256:" + hex.EncodeToString(sum.Sum(nil)); got != m.ArchiveDigest {
+		os.Remove(joinedPath)
+		return "", fmt.Errorf("%w: joined digest %s does not match manifest digest %s for [%s] ... re-run `hauler store save` to recreate the set", ErrIncompleteChunkSet, got, m.ArchiveDigest, joinedName)
+	}
+
+	l.Infof("joined and verified %d chunk(s) into [%s]", len(matches), joinedName)
 	return joinedPath, nil
 }

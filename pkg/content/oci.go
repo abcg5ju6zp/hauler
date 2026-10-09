@@ -1055,6 +1055,56 @@ func (o *OCI) UpdateAnnotations(match func(ocispec.Descriptor) bool, apply func(
 	return matched, o.saveIndexLocked(true)
 }
 
+// MergeIndex folds descs (the root descriptors of a layout being imported)
+// into this store's index in ONE critical section with ONE durable save, and
+// returns the number of entries merged. It applies exactly the same
+// normalization and nameMap keying as ociPusher.Push (legacy kind
+// translation, default image kind, per-ref+kind dedup with last-writer-wins),
+// so a batched import produces the same index an incremental copy would --
+// but a reader never observes a partially merged index and an interrupted
+// import leaves the previous index.json entirely intact (the rewrite is
+// temp-file + rename; see saveIndexLocked).
+//
+// Blob bytes are expected to have already been staged (digest-verified) by
+// the caller; MergeIndex touches the index only.
+func (o *OCI) MergeIndex(descs []ocispec.Descriptor) (int, error) {
+	o.lock()
+	defer o.mu.Unlock()
+
+	if err := o.loadIndexLocked(); err != nil {
+		return 0, err
+	}
+
+	merged := 0
+	for _, d := range descs {
+		// Mirror ociPusher.Push's index-merge rules exactly.
+		kind := d.Annotations[consts.KindAnnotationName]
+		kind = consts.NormalizeLegacyKind(kind)
+		if kind == "" {
+			kind = consts.KindAnnotationImage
+		}
+		normalizedAnnotations := make(map[string]string, len(d.Annotations)+1)
+		maps.Copy(normalizedAnnotations, d.Annotations)
+		normalizedAnnotations[consts.KindAnnotationName] = kind
+		d.Annotations = normalizedAnnotations
+
+		mapKey, ok, err := nameMapKey(d.Annotations[ocispec.AnnotationRefName], kind)
+		if err != nil {
+			return merged, fmt.Errorf("keying imported descriptor %s: %w", d.Digest, err)
+		}
+		if !ok {
+			continue
+		}
+		o.nameMap.Store(mapKey, d)
+		merged++
+	}
+
+	if merged == 0 {
+		return 0, nil
+	}
+	return merged, o.saveIndexLocked(true)
+}
+
 // ResolvePath returns the absolute path for a given relative path within the OCI root
 func (o *OCI) ResolvePath(elem string) string {
 	if elem == "" {

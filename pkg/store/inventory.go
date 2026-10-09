@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -55,6 +58,34 @@ func loadInventory(haulerDir string) storeInventory {
 	return inv
 }
 
+// fsyncPath flushes f, and fsyncDir flushes a directory entry so a rename
+// into it survives power loss. EINVAL/ENOTSUP are tolerated for NFS/SMB
+// store roots; Windows has no directory fsync equivalent.
+func fsyncPath(f *os.File) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return f.Sync()
+}
+
+func fsyncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+			return nil
+		}
+		return err
+	}
+	return d.Close()
+}
+
 func saveInventory(haulerDir string, inv storeInventory) error {
 	if err := ensureDir(haulerDir); err != nil {
 		return err
@@ -63,12 +94,30 @@ func saveInventory(haulerDir string, inv storeInventory) error {
 	if err != nil {
 		return err
 	}
-	// write to a temp file and rename to avoid a partially-written inventory
-	tmp := inventoryPath(haulerDir) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// write to a temp file, fsync, rename, fsync the directory: a
+	// partially-written or power-lost inventory can never replace the
+	// previously committed stores.json.
+	final := inventoryPath(haulerDir)
+	tmp := final + ".tmp"
+	tf, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, inventoryPath(haulerDir))
+	if _, err := tf.Write(data); err != nil {
+		tf.Close()
+		return err
+	}
+	if err := fsyncPath(tf); err != nil {
+		tf.Close()
+		return err
+	}
+	if err := tf.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		return err
+	}
+	return fsyncDir(haulerDir)
 }
 
 // updateStoreInventory records storeID's path in <haulerDir>/stores.json, pruning stale entries, under a lock so concurrent hauler processes can't drop each other's update.
@@ -102,6 +151,13 @@ func updateStoreInventory(haulerDir, storeID, path string) {
 	inv[storeID] = inventoryEntry{
 		Path:    path,
 		Updated: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	// A process killed during a previous saveInventory can have left its tmp
+	// behind; saveInventory truncates it, but remove a stale one explicitly so
+	// an unreadable orphan does not accumulate.
+	if err := os.Remove(inventoryPath(haulerDir) + ".tmp"); err != nil && !os.IsNotExist(err) {
+		zlog.Debug().Err(err).Msg("failed to remove stale store inventory temp")
 	}
 
 	if err := saveInventory(haulerDir, inv); err != nil {

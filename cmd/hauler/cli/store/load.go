@@ -16,7 +16,6 @@ import (
 	"hauler.dev/go/hauler/v2/pkg/archives"
 	"hauler.dev/go/hauler/v2/pkg/audit"
 	"hauler.dev/go/hauler/v2/pkg/consts"
-	"hauler.dev/go/hauler/v2/pkg/content"
 	"hauler.dev/go/hauler/v2/pkg/getter"
 	"hauler.dev/go/hauler/v2/pkg/log"
 	"hauler.dev/go/hauler/v2/pkg/store"
@@ -285,12 +284,10 @@ func unarchiveLayoutTo(ctx context.Context, haulPath string, dest string, tempDi
 		return err
 	}
 
-	ts, err := content.NewOCI(dest)
-	if err != nil {
-		return err
-	}
-
-	if _, err := s.CopyAll(ctx, ts, nil); err != nil {
+	// Stage the haul's full blob graph into dest with digest verification,
+	// then publish the merged index once: an interrupted or failed load
+	// leaves dest's index.json exactly as it was before the load started.
+	if err := s.ImportLayout(ctx, dest); err != nil {
 		return err
 	}
 

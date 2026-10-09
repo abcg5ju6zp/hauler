@@ -342,7 +342,9 @@ func TestSplitArchives_RemoveLeftoverChunks(t *testing.T) {
 	}
 }
 
-// TestSplitArchiveRedundant_NoTempFiles confirms shards are written in place, leaving nothing but the chunks behind.
+// TestSplitArchiveRedundant_NoTempFiles confirms publication leaves only the
+// chunks and their commit-marker sidecar: no hidden temp files or staging
+// directories survive a completed split.
 func TestSplitArchiveRedundant_NoTempFiles(t *testing.T) {
 	dir := t.TempDir()
 	archivePath := filepath.Join(dir, "haul.tar.zst")
@@ -352,8 +354,22 @@ func TestSplitArchiveRedundant_NoTempFiles(t *testing.T) {
 		t.Fatalf("SplitArchiveRedundant failed: %v", err)
 	}
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != len(chunks) {
-		t.Errorf("expected only %d chunks in the output dir, found %d entries", len(chunks), len(entries))
+	// chunks + the chunks.json publication manifest.
+	wantEntries := len(chunks) + 1
+	if len(entries) != wantEntries {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected %d entries (%d chunks + manifest) in the output dir, found %d: %v", wantEntries, len(chunks), len(entries), names)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			t.Errorf("hidden in-flight artifact left behind after publication: %s", e.Name())
+		}
+	}
+	if _, err := os.Stat(archivePath + chunkManifestSuffix); err != nil {
+		t.Errorf("chunk manifest sidecar missing after split: %v", err)
 	}
 }
 

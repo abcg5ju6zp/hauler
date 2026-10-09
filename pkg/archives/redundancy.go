@@ -3,7 +3,9 @@ package archives
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -141,7 +143,16 @@ func parityShardCount(dataShards, redundancyPercent int) int {
 	return k
 }
 
-// SplitArchiveRedundant splits the archive at archivePath, removing it afterward, into data and parity shards of at most maxBytes each such that any dataShards of the resulting chunks can reconstruct it.
+// SplitArchiveRedundant splits the archive at archivePath into data and parity
+// shards of at most maxBytes each such that any dataShards of the resulting
+// chunks can reconstruct it.
+//
+// Like SplitArchive, publication is staged and verified first: every shard is
+// built in a private staging directory, every shard checksum and the joined
+// archive digest are verified from disk, and only then are shards renamed over
+// the previous generation and the chunk manifest committed. The source
+// archive is removed last. An interrupted split therefore leaves neither
+// half-written shards at final names nor a missing source archive.
 func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int64, redundancyPercent int) ([]string, error) {
 	l := log.FromContext(ctx)
 
@@ -161,6 +172,12 @@ func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int
 		return nil, fmt.Errorf("archive requires [%d] chunks with recovery and exceeds the 256 chunk limit... use a larger --chunk-size or a lower --redundancy-percent", totalShards)
 	}
 
+	// Defensive standalone use (SaveCmd already swept): clear staging dirs a
+	// previously killed redundant split left behind.
+	if err := PrepareOutput(ctx, archivePath); err != nil {
+		return nil, err
+	}
+
 	enc, err := reedsolomon.NewStream(dataShards, parityShards)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create redundancy encoder: %w", err)
@@ -171,15 +188,25 @@ func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int
 		return nil, fmt.Errorf("failed to generate set id: %w", err)
 	}
 
-	// Each chunk is written in place as header then payload, with its checksum patched into the header once the payload is complete.
-	finalPaths := make([]string, totalShards)
+	stageDir, err := os.MkdirTemp(filepath.Dir(archivePath), fmt.Sprintf(tempSplitPattern, filepath.Base(archivePath)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create staging directory for redundant chunk split: %w", err)
+	}
+	published := false
+	defer func() {
+		if !published {
+			os.RemoveAll(stageDir)
+		}
+	}()
+
+	// Each chunk is written in stage as header then payload, with its checksum patched into the header once the payload is complete.
+	stagePaths := make([]string, totalShards)
 	files := make([]*os.File, totalShards)
 	sums := make([]hash.Hash32, totalShards)
 	cleanup := func() {
-		for i, f := range files {
+		for _, f := range files {
 			if f != nil {
 				f.Close()
-				os.Remove(finalPaths[i])
 			}
 		}
 	}
@@ -192,8 +219,8 @@ func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int
 			shardIndex:   uint16(i),
 			originalSize: uint64(archiveSize),
 		}
-		finalPaths[i] = fmt.Sprintf("%s.%03d", archivePath, i+1)
-		f, err := os.OpenFile(finalPaths[i], os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+		stagePaths[i] = filepath.Join(stageDir, fmt.Sprintf("%03d", i+1))
+		f, err := os.OpenFile(stagePaths[i], os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 		if err != nil {
 			cleanup()
 			return nil, fmt.Errorf("failed to create chunk [%d]: %w", i, err)
@@ -212,7 +239,10 @@ func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int
 		cleanup()
 		return nil, fmt.Errorf("failed to open archive for splitting: %w", err)
 	}
-	splitErr := enc.Split(src, shardWriters[:dataShards], archiveSize)
+	// Hash the source while the encoder consumes it, so the published
+	// manifest can bind the reassembled bytes end to end.
+	srcSum := sha256.New()
+	splitErr := enc.Split(io.TeeReader(src, srcSum), shardWriters[:dataShards], archiveSize)
 	src.Close()
 	if splitErr != nil {
 		cleanup()
@@ -247,12 +277,58 @@ func SplitArchiveRedundant(ctx context.Context, archivePath string, maxBytes int
 		}
 	}
 
-	if err := os.Remove(archivePath); err != nil {
-		return nil, fmt.Errorf("failed to remove original archive after splitting: %w", err)
+	// Verify before publish: every shard's header+payload CRC, and the joined
+	// data shards must reproduce the source archive's exact size and digest.
+	var staged []stagedChunk
+	for i := 0; i < totalShards; i++ {
+		h, ok, err := readShardHeader(stagePaths[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to read staged chunk header [%d]: %w", i+1, err)
+		}
+		if !ok {
+			return nil, fmt.Errorf("staged chunk [%d] is missing its redundancy header", i+1)
+		}
+		checksumOK, err := verifyShardChecksum(stagePaths[i], h)
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify staged chunk [%d]: %w", i+1, err)
+		}
+		if !checksumOK {
+			return nil, fmt.Errorf("staged chunk [%d] failed its checksum before publication", i+1)
+		}
+		st, err := os.Stat(stagePaths[i])
+		if err != nil {
+			return nil, fmt.Errorf("failed to stat staged chunk [%d]: %w", i+1, err)
+		}
+		staged = append(staged, stagedChunk{
+			stagePath: stagePaths[i],
+			finalName: fmt.Sprintf("%s.%03d", filepath.Base(archivePath), i+1),
+			size:      st.Size(),
+		})
 	}
-	if err := removeLeftoverChunks(ctx, archivePath, totalShards); err != nil {
+
+	joinSum := sha256.New()
+	joinReaders := make([]io.Reader, dataShards)
+	for i := 0; i < dataShards; i++ {
+		f, err := shardPayloadReader(stagePaths[i])
+		if err != nil {
+			return nil, fmt.Errorf("re-opening staged data chunk [%d] for verification: %w", i+1, err)
+		}
+		defer f.Close()
+		joinReaders[i] = f
+	}
+	if err := enc.Join(joinSum, joinReaders, archiveSize); err != nil {
+		return nil, fmt.Errorf("reassembling staged chunks for verification: %w", err)
+	}
+	archiveDigest := "sha256:" + hex.EncodeToString(srcSum.Sum(nil))
+	if got := "sha256:" + hex.EncodeToString(joinSum.Sum(nil)); got != archiveDigest {
+		return nil, fmt.Errorf("staged redundant chunks reassemble to %s, source archive is %s", got, archiveDigest)
+	}
+
+	finalPaths, err := publishStagedChunks(ctx, archivePath, stageDir, staged, hex.EncodeToString(setID[:]), archiveDigest, archiveSize, true)
+	if err != nil {
 		return nil, err
 	}
+	published = true
 
 	l.Infof("split [%s] into %d chunk(s) with %d recovery chunk(s)", filepath.Base(archivePath), totalShards, parityShards)
 	l.Infof("haul can recover up to [%d] lost or corrupted chunk(s)", parityShards)
@@ -273,8 +349,8 @@ func isRedundantChunkSet(matches []string) (bool, error) {
 	return false, nil
 }
 
-// reconstructAndJoin reassembles the original archive in tempDir from a chunk set already identified as redundant, transparently repairing any missing or corrupted shards from parity before joining.
-func reconstructAndJoin(ctx context.Context, matches []string, tempDir, joinedName string) (string, error) {
+// reconstructAndJoin reassembles the original archive in tempDir from a chunk set already identified as redundant, transparently repairing any missing or corrupted shards from parity before joining. When manifest is non-nil (a current-hauler publication marker), the repaired result must additionally match the recorded size and digest -- parity verification alone cannot prove the repaired bytes match the archive that was actually published.
+func reconstructAndJoin(ctx context.Context, matches []string, tempDir, joinedName string, manifest *chunkManifest) (string, error) {
 	l := log.FromContext(ctx)
 
 	// Only checksum-verified shards are trusted, and when chunks from more than one save are mixed together the save with the most verified shards wins.
@@ -422,14 +498,33 @@ func reconstructAndJoin(ctx context.Context, matches []string, tempDir, joinedNa
 	if err != nil {
 		return "", fmt.Errorf("failed to create reassembled archive: %w", err)
 	}
-	joinErr := enc.Join(out, valid[:header.dataShards], int64(header.originalSize))
+	// Hash while joining so a manifest-bearing set can be checked end to end
+	// after parity repair, and a short write at close cannot hand extraction
+	// a truncated archive.
+	sum := sha256.New()
+	joinErr := enc.Join(io.MultiWriter(out, sum), valid[:header.dataShards], int64(header.originalSize))
 	// Close can report the final write failing (e.g. a full disk), which would otherwise hand extraction a truncated archive.
 	closeErr := out.Close()
 	if joinErr != nil {
+		os.Remove(outPath)
 		return "", fmt.Errorf("failed to reassemble archive from chunks: %w", joinErr)
 	}
 	if closeErr != nil {
+		os.Remove(outPath)
 		return "", fmt.Errorf("failed to write reassembled archive: %w", closeErr)
+	}
+
+	if manifest != nil {
+		if info, statErr := os.Stat(outPath); statErr == nil && info.Size() != manifest.ArchiveSize {
+			os.Remove(outPath)
+			return "", fmt.Errorf("%w: repaired archive is %d bytes, manifest records %d ... re-run `hauler store save` to recreate the set", ErrIncompleteChunkSet, info.Size(), manifest.ArchiveSize)
+		}
+		got := "sha256:" + hex.EncodeToString(sum.Sum(nil))
+		if got != manifest.ArchiveDigest {
+			os.Remove(outPath)
+			return "", fmt.Errorf("%w: repaired archive digest %s does not match manifest digest %s ... re-run `hauler store save` to recreate the set", ErrIncompleteChunkSet, got, manifest.ArchiveDigest)
+		}
+		l.Infof("repaired archive matches recorded digest [%s]", got)
 	}
 
 	return outPath, nil

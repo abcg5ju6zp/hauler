@@ -101,6 +101,11 @@ func NewLayout(rootdir string, opts ...Options) (*Layout, error) {
 	}
 	l.OCI = ociStore
 
+	// Recover from a process that died mid-write before this store is used:
+	// only hidden internal temp patterns are swept; a completed store is
+	// untouched. Best effort and non-fatal.
+	cleanupInterruptedArtifacts(rootdir)
+
 	if l.haulerDir != "" {
 		updateStoreInventory(l.haulerDir, l.StoreID, rootdir)
 	}

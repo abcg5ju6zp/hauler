@@ -11,8 +11,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	referencev3 "github.com/distribution/reference"
+	"github.com/gofrs/flock"
 	goname "github.com/google/go-containerregistry/pkg/name"
 	libv1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
@@ -50,6 +52,28 @@ func SaveCmd(ctx context.Context, o *flags.SaveOpts, s *store.Layout, rso *flags
 
 	absOutputfile, err := filepath.Abs(o.FileName)
 	if err != nil {
+		return err
+	}
+
+	// Serialize saves that publish the same output path: two concurrent
+	// processes must not interleave archive verification, chunk generation
+	// swaps, or mode-switch cleanup. The OS releases the lock if this process
+	// dies, so it never needs manual recovery; duplicate saves simply run one
+	// after the other and converge on identical output.
+	archiveLock := flock.New(absOutputfile + ".lock")
+	locked, err := archiveLock.TryLockContext(ctx, 250*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("waiting for another `hauler store save` writing [%s]: %w", o.FileName, err)
+	}
+	if !locked {
+		return fmt.Errorf("could not acquire save lock for [%s]", o.FileName)
+	}
+	defer archiveLock.Unlock()
+
+	// Remove in-flight temps/staging dirs a previously killed save to this
+	// same output left behind, so this run starts from a clean, known state.
+	// Completed archives and chunk sets are never touched.
+	if err := archives.PrepareOutput(ctx, absOutputfile); err != nil {
 		return err
 	}
 
@@ -137,10 +161,14 @@ func SaveCmd(ctx context.Context, o *flags.SaveOpts, s *store.Layout, rso *flags
 			// loss (#744 fix 3).
 			continue
 		}
-		if full == absOutputfile {
-			// Saving the archive into the store dir: ArchiveFiles removes
-			// absOutputfile before reading fileMap, so mapping it here would
-			// point at a path FilesFromDisk can no longer find.
+		if store.IsImportLock(name) {
+			// cross-process load lock transient to the store directory
+			continue
+		}
+		if isSaveOutputFamily(o.StoreDir, name, absOutputfile) {
+			// The archive and its lock/chunks/sidecar/temps live in (or are
+			// being rebuilt in) the store directory itself; packing them into
+			// the haul would nest an archive in itself.
 			continue
 		}
 		files[full] = name
@@ -173,6 +201,12 @@ func SaveCmd(ctx context.Context, o *flags.SaveOpts, s *store.Layout, rso *flags
 			l.Infof("saving store [%s] to chunk [%s]", o.StoreDir, filepath.Base(c))
 		}
 	} else {
+		// A single-file archive now supersedes any earlier chunked save to
+		// the same name; retire the old set only after the new archive was
+		// itself verified and committed.
+		if err := archives.DiscardChunkSet(ctx, absOutputfile); err != nil {
+			l.Warnf("failed to remove chunk set superseded by [%s]: %v", o.FileName, err)
+		}
 		l.Infof("saving store [%s] to archive [%s]", o.StoreDir, o.FileName)
 	}
 
@@ -201,6 +235,36 @@ func SaveCmd(ctx context.Context, o *flags.SaveOpts, s *store.Layout, rso *flags
 	}
 
 	return nil
+}
+
+// isSaveOutputFamily reports whether name, a direct child of storeDir, is
+// part of the save publication family for absOutput (the archive itself, its
+// publish lock, chunk set + manifest, or hidden in-flight temps). Only applies
+// when the output lives directly in storeDir; it keeps an archive saved into
+// the store from being packed into its own haul, without filtering unrelated
+// store content.
+func isSaveOutputFamily(storeDir, name, absOutput string) bool {
+	if filepath.Clean(filepath.Dir(absOutput)) != filepath.Clean(storeDir) {
+		return false
+	}
+	base := filepath.Base(absOutput)
+	switch name {
+	case base, base + ".lock", base + ".chunks.json":
+		return true
+	}
+	// published chunks: <base>.NNN (current scheme and the unambiguous
+	// legacy <base>_N<ext> subset)
+	if key, ok := archives.ChunkGroupKey(name); ok && key == base {
+		return true
+	}
+	// hidden in-flight artifacts: .<base>.tmp-*, .<base>.split-*,
+	// .<base>.chunks-*
+	for _, prefix := range []string{"." + base + ".tmp-", "." + base + ".split-", "." + base + ".chunks-"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseChunkSize parses a human-readable byte size string (e.g. "1G", "500M", "2GB")
