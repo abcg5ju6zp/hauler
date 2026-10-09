@@ -174,7 +174,7 @@ func TestCheckBlob_SizeMismatchShortCircuits(t *testing.T) {
 	}
 
 	c := s.NewChecker()
-	res := c.CheckBlob(ocispec.Descriptor{Digest: victim.Digest, Size: victim.Size})
+	res := c.CheckBlob(context.Background(), ocispec.Descriptor{Digest: victim.Digest, Size: victim.Size})
 
 	if res.Status != store.BlobSizeMismatch {
 		t.Fatalf("status = %q, want %q (detail: %s)", res.Status, store.BlobSizeMismatch, res.Detail)
@@ -220,7 +220,7 @@ func TestCheckBlob_SameLengthCorruptionIsDigestMismatch(t *testing.T) {
 	}
 
 	c := s.NewChecker()
-	res := c.CheckBlob(ocispec.Descriptor{Digest: victim.Digest, Size: victim.Size})
+	res := c.CheckBlob(context.Background(), ocispec.Descriptor{Digest: victim.Digest, Size: victim.Size})
 
 	if res.Status != store.BlobDigestMismatch {
 		t.Fatalf("status = %q, want %q (detail: %s) -- a size-only check would incorrectly pass this same-length corruption",

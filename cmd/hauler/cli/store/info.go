@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/olekukonko/tablewriter/tw"
@@ -22,26 +23,227 @@ import (
 type infoOutput struct {
 	StorePath string `json:"store-path"`
 	StoreID   string `json:"store-id"`
-	Artifacts []item `json:"artifacts"`
+	// Check is present (non-nil) only for `info --check` runs; it identifies
+	// the check session and whether verification finished.
+	Check     *checkSummaryOutput `json:"check,omitempty"`
+	Artifacts []item              `json:"artifacts"`
+}
+
+// checkSummaryOutput is the machine-readable check-session block rendered with
+// `info --check -o json`. Complete=false is the signal that the artifacts list
+// only covers a partial run and must not be read as a clean bill of health.
+type checkSummaryOutput struct {
+	Session    string    `json:"session"`
+	Complete   bool      `json:"complete"`
+	StartedAt  time.Time `json:"started-at"`
+	FinishedAt time.Time `json:"finished-at"`
+
+	// Artifacts is the number of checkable units after --type filtering;
+	// ArtifactsChecked of them were reached before the run ended, of which
+	// ArtifactsFailed had problems and ArtifactsUnreached were never reached.
+	Artifacts          int `json:"artifacts"`
+	ArtifactsChecked   int `json:"artifacts-checked"`
+	ArtifactsFailed    int `json:"artifacts-failed"`
+	ArtifactsUnreached int `json:"artifacts-unreached"`
+
+	// BlobsChecked is the number of distinct blobs the session reached a
+	// verdict on; BlobsHashed is how many of those were streamed through a
+	// digest verifier (shared blobs hash once).
+	BlobsChecked int `json:"blobs-checked"`
+	BlobsHashed  int `json:"blobs-hashed"`
 }
 
 func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
-	var checker *store.Checker
 	if o.Check {
-		checker = s.NewChecker()
+		return runStoreCheck(ctx, o, s)
+	}
+	return runStoreList(ctx, o, s)
+}
 
-		total := 0
+// runStoreCheck implements `store info --check`: one whole-store check session
+// drives the whole report. Per-artifact failures are collected as rows rather
+// than aborting the walk, healthy artifacts are omitted, and an interrupted run
+// is rendered as a partial report plus a non-nil error instead of a generic
+// success.
+func runStoreCheck(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
+	logger := log.FromContext(ctx)
+
+	if o.ListRepos {
+		// Repo names come from index annotations alone; no blob hashing needed.
+		var refs []item
 		_ = s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
-			if _, ok := desc.Annotations[ocispec.AnnotationRefName]; ok {
-				total++
+			if ref := desc.Annotations[ocispec.AnnotationRefName]; ref != "" {
+				refs = append(refs, item{Reference: ref})
 			}
 			return nil
 		})
-		log.FromContext(ctx).Infof("checking integrity of %d artifacts... this reads every blob in the store", total)
+		buildListRepos(refs...)
+		return nil
 	}
 
+	var rootTotal int
+	_ = s.OCI.Walk(func(_ string, desc ocispec.Descriptor) error {
+		if _, ok := desc.Annotations[ocispec.AnnotationRefName]; ok {
+			rootTotal++
+		}
+		return nil
+	})
+	logger.Infof("checking integrity of %d artifacts... this reads every blob in the store", rootTotal)
+
+	checker := s.NewChecker()
+	report := checker.CheckStore(ctx)
+
+	items, summary := buildCheckItems(o, report)
+
+	sort.Sort(byReferenceAndArch(items))
+
+	switch o.OutputFormat {
+	case "json":
+		out := infoOutput{
+			StorePath: s.Root,
+			StoreID:   s.StoreID,
+			Check:     summary.checkSummary(),
+			Artifacts: items,
+		}
+		data, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+	default:
+		// The failure table lists every known-bad and not-reached unit; a
+		// fully healthy run renders no table at all.
+		if len(items) > 0 {
+			if err := buildFailureTable(s.Root, s.StoreID, items...); err != nil {
+				return err
+			}
+		}
+	}
+
+	if !summary.Complete {
+		logger.Errorf(
+			"integrity check did not finish; results are incomplete: verified %d of %d artifacts (%d failed, %d not reached); re-run the check to cover the rest",
+			summary.matched-summary.unreached, summary.matched, summary.failed, summary.unreached,
+		)
+		if summary.failed > 0 {
+			logger.Warnf("to remediate, remove and re-add the affected artifact(s)")
+		}
+		return fmt.Errorf("store integrity check was interrupted before completion (session %s)", summary.Session)
+	}
+
+	if summary.failed > 0 {
+		logger.Warnf("%d of %d artifacts failed the integrity check", summary.failed, summary.matched)
+		logger.Warnf("to remediate, remove and re-add the affected artifact(s)")
+	} else {
+		logger.Infof("all %d artifacts passed the integrity check", summary.matched)
+	}
+
+	return nil
+}
+
+// checkItemAccumulator carries the counters that back checkSummaryOutput while
+// buildCheckItems walks the report.
+type checkItemAccumulator struct {
+	Session    string
+	Complete   bool
+	StartedAt  time.Time
+	FinishedAt time.Time
+
+	matched    int
+	failed     int
+	unreached  int
+	blobsCheck int
+	blobsHash  int
+}
+
+func (a *checkItemAccumulator) checkSummary() *checkSummaryOutput {
+	return &checkSummaryOutput{
+		Session:            a.Session,
+		Complete:           a.Complete,
+		StartedAt:          a.StartedAt,
+		FinishedAt:         a.FinishedAt,
+		Artifacts:          a.matched,
+		ArtifactsChecked:   a.matched - a.unreached,
+		ArtifactsFailed:    a.failed,
+		ArtifactsUnreached: a.unreached,
+		BlobsChecked:       a.blobsCheck,
+		BlobsHashed:        a.blobsHash,
+	}
+}
+
+// buildCheckItems maps a store.CheckReport onto the failure-report item shape,
+// applying the --type filter exactly as the non-check inventory does. Healthy
+// units are omitted; reached-but-bad units carry their blob problems;
+// not-reached units (an interrupted run) carry a distinct "unverified" row so
+// the gap in coverage is visible per-object.
+func buildCheckItems(o *flags.InfoOpts, report *store.CheckReport) ([]item, *checkItemAccumulator) {
+	acc := &checkItemAccumulator{
+		Session:    report.SessionID,
+		Complete:   report.Complete,
+		StartedAt:  report.StartedAt,
+		FinishedAt: report.FinishedAt,
+		blobsCheck: report.BlobsChecked,
+		blobsHash:  report.BlobsHashed,
+	}
+
+	items := []item{}
+
+	for _, u := range report.Artifacts {
+		synth := ocispec.Descriptor{
+			MediaType:   u.MediaType,
+			Annotations: u.Annotations,
+		}
+		ctype := resolveCtype(synth, u.ConfigMediaType)
+		if o.TypeFilter != "all" && ctype != o.TypeFilter {
+			continue
+		}
+		acc.matched++
+
+		refName, err := resolveDisplayReference(synth)
+		if err != nil {
+			continue
+		}
+
+		if !u.Reached {
+			acc.unreached++
+			p := store.BlobResult{
+				Digest: u.Digest,
+				Status: store.BlobUnverified,
+				Detail: "artifact not reached before the check was interrupted",
+			}
+			items = append(items, item{
+				Reference:    refName,
+				Type:         ctype,
+				Platform:     u.Platform,
+				Digest:       u.Digest,
+				Problems:     problemStrings([]store.BlobResult{p}),
+				blobProblems: []store.BlobResult{p},
+			})
+			continue
+		}
+
+		if len(u.Problems) == 0 {
+			continue
+		}
+
+		acc.failed++
+		items = append(items, item{
+			Reference:    refName,
+			Type:         ctype,
+			Platform:     u.Platform,
+			Digest:       u.Digest,
+			Problems:     problemStrings(u.Problems),
+			blobProblems: u.Problems,
+		})
+	}
+
+	return items, acc
+}
+
+// runStoreList implements the non-check inventory; its shape predates --check
+// and is kept separate so check reporting can't alter plain `store info`.
+func runStoreList(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 	var items []item
-	var totalChecked, totalCorrupt int
 
 	if err := s.Walk(func(_ string, desc ocispec.Descriptor) error {
 		if _, ok := desc.Annotations[ocispec.AnnotationRefName]; !ok {
@@ -55,30 +257,9 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 
 		// handle multi-arch images
 		if desc.MediaType == consts.OCIImageIndexSchema || desc.MediaType == consts.DockerManifestListSchema2 {
-			if o.Check && (o.TypeFilter == "all" || o.TypeFilter == "image") {
-				if res := checker.CheckBlob(desc); res.Status != store.BlobOK {
-					if addFallbackRow(&items, desc, "-", o, res) {
-						totalChecked++
-						totalCorrupt++
-					}
-					return nil
-				}
-			}
-
 			var idx ocispec.Index
 			if err := json.NewDecoder(rc).Decode(&idx); err != nil {
-				if !o.Check {
-					return err
-				}
-				if addFallbackRow(&items, desc, "-", o, store.BlobResult{
-					Digest: desc.Digest.String(),
-					Status: store.BlobUnreadable,
-					Detail: fmt.Sprintf("image index JSON decode failed: %v", err),
-				}) {
-					totalChecked++
-					totalCorrupt++
-				}
-				return nil
+				return err
 			}
 
 			for _, internalDesc := range idx.Manifests {
@@ -92,18 +273,7 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 
 				var internalManifest ocispec.Manifest
 				if err := json.NewDecoder(rc).Decode(&internalManifest); err != nil {
-					if !o.Check {
-						return err
-					}
-					if addFallbackRow(&items, desc, plat, o, store.BlobResult{
-						Digest: internalDesc.Digest.String(),
-						Status: store.BlobUnreadable,
-						Detail: fmt.Sprintf("platform manifest JSON decode failed: %v", err),
-					}) {
-						totalChecked++
-						totalCorrupt++
-					}
-					continue
+					return err
 				}
 
 				ctype := resolveCtype(desc, internalManifest.Config.MediaType)
@@ -116,37 +286,14 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 					continue
 				}
 
-				if o.Check {
-					res := checker.Check(ctx, internalDesc)
-					totalChecked++
-					outcome := "ok"
-					if corrupt := attachProblems(&i, res); corrupt {
-						outcome = "corrupt"
-						totalCorrupt++
-						items = append(items, i)
-					}
-					log.FromContext(ctx).Debugf("checked %s (%s): %s", i.Reference, i.Platform, outcome)
-				} else {
-					items = append(items, i)
-				}
+				items = append(items, i)
 			}
 
 			// handle "non" multi-arch images
 		} else if desc.MediaType == consts.DockerManifestSchema2 || desc.MediaType == consts.OCIManifestSchema1 {
 			var m ocispec.Manifest
 			if err := json.NewDecoder(rc).Decode(&m); err != nil {
-				if !o.Check {
-					return err
-				}
-				if addFallbackRow(&items, desc, "-", o, store.BlobResult{
-					Digest: desc.Digest.String(),
-					Status: store.BlobUnreadable,
-					Detail: fmt.Sprintf("manifest JSON decode failed: %v", err),
-				}) {
-					totalChecked++
-					totalCorrupt++
-				}
-				return nil
+				return err
 			}
 
 			ctype := resolveCtype(desc, m.Config.MediaType)
@@ -156,36 +303,14 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 
 			rc2, err := s.FetchManifest(ctx, m)
 			if err != nil {
-				if !o.Check {
-					return err
-				}
-				if addFallbackRow(&items, desc, "-", o, store.BlobResult{
-					Digest: m.Config.Digest.String(),
-					Status: store.BlobUnreadable,
-					Detail: fmt.Sprintf("fetching image config failed: %v", err),
-				}) {
-					totalChecked++
-					totalCorrupt++
-				}
-				return nil
+				return err
 			}
 			defer rc2.Close()
 
 			// unmarshal the oci image content
 			var internalManifest ocispec.Image
 			if err := json.NewDecoder(rc2).Decode(&internalManifest); err != nil {
-				if !o.Check {
-					return err
-				}
-				if addFallbackRow(&items, desc, "-", o, store.BlobResult{
-					Digest: m.Config.Digest.String(),
-					Status: store.BlobUnreadable,
-					Detail: fmt.Sprintf("image config JSON decode failed: %v", err),
-				}) {
-					totalChecked++
-					totalCorrupt++
-				}
-				return nil
+				return err
 			}
 
 			plat := "-"
@@ -198,36 +323,13 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 				return nil
 			}
 
-			if o.Check {
-				res := checker.Check(ctx, desc)
-				totalChecked++
-				outcome := "ok"
-				if corrupt := attachProblems(&i, res); corrupt {
-					outcome = "corrupt"
-					totalCorrupt++
-					items = append(items, i)
-				}
-				log.FromContext(ctx).Debugf("checked %s: %s", i.Reference, outcome)
-			} else {
-				items = append(items, i)
-			}
+			items = append(items, i)
 
 			// handle everything else (charts, files, sigs, etc.)
 		} else {
 			var m ocispec.Manifest
 			if err := json.NewDecoder(rc).Decode(&m); err != nil {
-				if !o.Check {
-					return err
-				}
-				if addFallbackRow(&items, desc, "-", o, store.BlobResult{
-					Digest: desc.Digest.String(),
-					Status: store.BlobUnreadable,
-					Detail: fmt.Sprintf("manifest JSON decode failed: %v", err),
-				}) {
-					totalChecked++
-					totalCorrupt++
-				}
-				return nil
+				return err
 			}
 
 			ctype := resolveCtype(desc, m.Config.MediaType)
@@ -240,19 +342,7 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 				return nil
 			}
 
-			if o.Check {
-				res := checker.Check(ctx, desc)
-				totalChecked++
-				outcome := "ok"
-				if corrupt := attachProblems(&i, res); corrupt {
-					outcome = "corrupt"
-					totalCorrupt++
-					items = append(items, i)
-				}
-				log.FromContext(ctx).Debugf("checked %s: %s", i.Reference, outcome)
-			} else {
-				items = append(items, i)
-			}
+			items = append(items, i)
 		}
 
 		return nil
@@ -285,25 +375,8 @@ func InfoCmd(ctx context.Context, o *flags.InfoOpts, s *store.Layout) error {
 		}
 		fmt.Println(string(data))
 	default:
-		if o.Check {
-			if totalCorrupt > 0 {
-				if err := buildFailureTable(s.Root, s.StoreID, items...); err != nil {
-					return err
-				}
-			}
-		} else {
-			if err := buildTable(s.Root, s.StoreID, o.ShowDigests, items...); err != nil {
-				return err
-			}
-		}
-	}
-
-	if o.Check {
-		if totalCorrupt > 0 {
-			log.FromContext(ctx).Warnf("%d of %d artifacts failed the integrity check", totalCorrupt, totalChecked)
-			log.FromContext(ctx).Warnf("to remediate, remove and re-add the affected artifact(s)")
-		} else {
-			log.FromContext(ctx).Infof("all %d artifacts passed the integrity check", totalChecked)
+		if err := buildTable(s.Root, s.StoreID, o.ShowDigests, items...); err != nil {
+			return err
 		}
 	}
 
@@ -409,12 +482,12 @@ const issueColumnMaxWidth = 50
 
 // buildFailureTable renders the --check failure report: a fixed-column table
 // (Reference | Type | Platform | Digest | Issue) containing only the artifacts
-// that failed their integrity check, one row per problem so an artifact with
-// multiple bad blobs gets multiple rows. This shape does not vary with
-// showDigests/o.ShowDigests -- that flag only affects the non-check inventory
-// table produced by buildTable. The Issue column is word-wrapped (with
-// mid-token breaks, see the AutoWrap comment below) to a fixed width so an
-// unbounded issueText value can't blow out the table's layout.
+// that failed their integrity check or were never reached, one row per problem
+// so an artifact with multiple bad blobs gets multiple rows. This shape does not
+// vary with showDigests/o.ShowDigests -- that flag only affects the non-check
+// inventory table produced by buildTable. The Issue column is word-wrapped
+// (with mid-token breaks, see the AutoWrap comment below) to a fixed width so an
+// unbounded issueText value can't blow out the table layout.
 func buildFailureTable(storePath, storeID string, items ...item) error {
 	table := tablewriter.NewTable(os.Stdout)
 	table.Configure(func(cfg *tablewriter.Config) {
@@ -489,6 +562,11 @@ func issueText(r store.BlobResult) string {
 		return "size mismatch"
 	case store.BlobDigestMismatch:
 		return "digest mismatch"
+	case store.BlobUnverified:
+		if r.Detail != "" {
+			return "not verified: " + r.Detail
+		}
+		return "not verified"
 	case store.BlobUnreadable:
 		if r.Detail != "" {
 			return "unreadable: " + r.Detail
@@ -519,7 +597,7 @@ type item struct {
 	Digest    string   `json:"digest,omitempty"`
 	Layers    int      `json:"layers"`
 	Size      int64    `json:"size"`
-	Problems  []string `json:"problems,omitempty"` // populated only for corrupt items
+	Problems  []string `json:"problems,omitempty"` // populated only for corrupt/unreached items
 
 	// blobProblems holds the same information as Problems but as structured
 	// store.BlobResult values, used by buildFailureTable to render one row per
@@ -645,9 +723,8 @@ func resolveCtype(desc ocispec.Descriptor, configMediaType string) string {
 }
 
 // fallbackItem builds a synthetic failure row directly from desc's index
-// annotations -- no blob read beyond what's already been done is required. It is
-// used under --check when a manifest can't be trusted: its own digest check
-// failed, or its bytes decoded but the JSON was malformed. plat defaults to "-".
+// annotations -- no blob read beyond what's already been done is required.
+// plat defaults to "-".
 //
 // Type is resolved with an empty configMediaType, since charts/files carry the same
 // KindAnnotationImage as regular images in the store index and so cannot be told
@@ -674,36 +751,6 @@ func fallbackItem(desc ocispec.Descriptor, plat string, problem store.BlobResult
 	}
 }
 
-// addFallbackRow appends a fallbackItem for desc unless its best-guess type doesn't
-// match an active --type filter, in which case it is silently dropped -- exactly
-// like any other filtered-out artifact -- so a filtered corrupt row costs nothing.
-// It returns whether the row was actually appended, so callers can keep their
-// totalChecked/totalCorrupt counters in sync with what's shown: incrementing
-// unconditionally would overcount relative to a row silently dropped by a --type
-// filter.
-func addFallbackRow(items *[]item, desc ocispec.Descriptor, plat string, o *flags.InfoOpts, problem store.BlobResult) bool {
-	row := fallbackItem(desc, plat, problem)
-	if row.isEmpty() {
-		return false
-	}
-	if o.TypeFilter != "all" && row.Type != o.TypeFilter {
-		return false
-	}
-	*items = append(*items, row)
-	return true
-}
-
-// attachProblems populates i.Problems/i.blobProblems from a store.CheckResult and
-// reports whether the artifact is corrupt (res.OK == false).
-func attachProblems(i *item, res store.CheckResult) bool {
-	if res.OK {
-		return false
-	}
-	i.Problems = problemStrings(res.Problems)
-	i.blobProblems = res.Problems
-	return true
-}
-
 // problemStrings converts a slice of store.BlobResult problems into human-readable
 // strings suitable for JSON output (words, never glyphs).
 func problemStrings(problems []store.BlobResult) []string {
@@ -727,6 +774,8 @@ func problemMessage(r store.BlobResult) string {
 		word = "digest mismatch"
 	case store.BlobUnreadable:
 		word = "unreadable"
+	case store.BlobUnverified:
+		word = "not verified"
 	}
 	if r.Detail != "" {
 		return fmt.Sprintf("%s: %s (%s)", r.Digest, word, r.Detail)
